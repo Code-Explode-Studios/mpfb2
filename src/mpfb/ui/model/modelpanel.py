@@ -7,6 +7,7 @@ from ...services import TargetService
 from ...services import UiService
 from ...services import SceneConfigSet
 
+
 _LOG = LogService.get_logger("model.modelpanel")
 
 _LOC = os.path.dirname(__file__)
@@ -47,6 +48,17 @@ class MPFB_PT_Model_Panel(bpy.types.Panel):
         box.operator('mpfb.refit_human')
         box.operator('mpfb.prune_human')
 
+    def _randomization(self, scene, layout):     
+        box = self._create_box(layout, "Randomization")     
+        row = layout.row()
+        #box.operator("mpfb.randomize_race")
+        #row = layout.row()
+        #box.operator("Implement Randomize Body operator here")        
+        #row = layout.row()
+        #box.operator("Implement Randomize Face operator here")
+        #row = layout.row()
+        #box.operator("Implement Randomize Macros operator here")
+
     def draw(self, context):
         _LOG.enter()
         layout = self.layout
@@ -62,9 +74,11 @@ class MPFB_PT_Model_Panel(bpy.types.Panel):
         if TargetService.has_any_shapekey(basemesh):
             self._settings(scene, layout)
             self._general(scene, layout)
+            self._randomization(scene, layout)
         else:
             layout.label(text="Cannot model baked mesh")
-            layout.label(text="See docs for alternatives")
+            layout.label(text="See docs for alternatives")            
+
 
     @classmethod
     def poll(cls, context):
