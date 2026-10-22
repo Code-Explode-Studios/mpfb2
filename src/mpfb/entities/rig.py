@@ -5,9 +5,11 @@ import bmesh
 from ..services import LogService
 from ..services import ObjectService
 from ..services import RigService
+from ..types import BoneInfo, RigDefinition, RigHeader
 from .objectproperties import GeneralObjectProperties
 
 import bpy, math, json, random, typing, re
+import secrets
 
 from bl_math import lerp
 from itertools import accumulate
@@ -25,31 +27,49 @@ CLOSE_MEAN_SEARCH_RADIUS = _MAX_ALLOWED_DIST * 2
 
 CUR_VERSION = 110
 
+# Type hint annotation helpers
+BoneEndInfo = dict[str, typing.Any]
+BendyBoneInfo = dict[str, typing.Any]
+ConstraintInfo = dict[str, typing.Any]
+ParentBoneRef = dict[str, typing.Any]
+PositionInfo = dict[str, typing.Any]
+BoneChain = list[str]
+ParentChainBone = tuple[str, float | None, BoneChain]
+VertexWeights = dict[str, float]
+
+# Note on the RigService bone finders, referred to from the sites below which call them.
+#
+# RigService.find_edit_bone_by_name() and find_pose_bone_by_name() return an optional, because the
+# blender collections they read do. Every call below looks up a bone name taken from this rig's own
+# definition, in an armature this class has just built from that same definition, so the lookup
+# cannot miss; the casts record that contract. reposition_edit_bone() is the exception and already
+# guards, because it runs against an armature the caller supplied rather than one this class built,
+# and it warns and skips a bone the definition names but the armature does not have.
 
 class Rig:
 
     """Entity class representing an armature."""
 
-    armature_object: bpy.types.Object
+    armature_object: bpy.types.Object | None
 
-    def __init__(self, basemesh, armature=None, *, parent: typing.Optional['Rig']=None):
+    def __init__(self, basemesh: bpy.types.Object, armature: bpy.types.Object | None=None, *, parent: "Rig | None"=None) -> None:
         """You might want to use one of the static methods rather than calling init directly."""
         self.basemesh = basemesh
         self.armature_object = armature
         self.parent = parent
-        self.position_info = dict()
-        self.rig_definition = dict()
-        self.rig_header = {
+        self.position_info: PositionInfo = dict()
+        self.rig_definition: RigDefinition = dict()
+        self.rig_header: RigHeader = {
             "bones": self.rig_definition,
             "is_subrig": bool(parent),
             "version": CUR_VERSION,
         }
         self.lowest_point = 1000.0
-        self.bad_constraint_targets = set()
+        self.bad_constraint_targets: set[str] = set()
         self.relative_scale = 1.0
 
     @staticmethod
-    def from_json_file_and_basemesh(filename, basemesh, *, parent=None):
+    def from_json_file_and_basemesh(filename: str, basemesh: bpy.types.Object, *, parent: "Rig | None"=None) -> "Rig":
         """Create an instance of Rig and populate it with information from the json file and from the base mesh."""
         rig = Rig(basemesh, parent=parent)
 
@@ -88,7 +108,7 @@ class Rig:
         rig.build_basemesh_position_info()
         return rig
 
-    def _upgrade_definition(self):
+    def _upgrade_definition(self) -> bool:
         version = self.rig_header["version"]
         if version == CUR_VERSION:
             return False
@@ -131,8 +151,8 @@ class Rig:
 
     @staticmethod
     def from_given_armature_context(armature_object: bpy.types.Object | None, *,
-                                    is_subrig: bool | None=None, operator=None,
-                                    empty=False, fast_positions=False, rigify_ui=False):
+                                    is_subrig: bool | None=None, operator: bpy.types.Operator | None=None,
+                                    empty: bool=False, fast_positions: bool=False, rigify_ui: bool=False) -> "Rig | None":
         """Create an instance of Rig and populate it with information from the armature and related meshes."""
 
         base_rig, basemesh, direct_mesh = ObjectService.find_armature_context_objects(
@@ -140,6 +160,12 @@ class Rig:
 
         if not direct_mesh:
             return None
+
+        # find_armature_context_objects returns Object | None for each member; reaching this
+        # point with direct_mesh set means the related objects are present too.
+        base_rig = typing.cast(bpy.types.Object, base_rig)
+        basemesh = typing.cast(bpy.types.Object, basemesh)
+        armature_object = typing.cast(bpy.types.Object, armature_object)
 
         if direct_mesh != basemesh:
             parent_rig = Rig.from_given_basemesh_and_armature(basemesh, base_rig, fast_positions=True)
@@ -155,8 +181,9 @@ class Rig:
             )
 
     @staticmethod
-    def from_given_basemesh_and_armature(basemesh, armature, *, parent=None, empty=False, fast_positions=False,
-                                         rigify_ui=False):
+    def from_given_basemesh_and_armature(basemesh: bpy.types.Object, armature: bpy.types.Object, *,
+                                         parent: "Rig | None"=None, empty: bool=False, fast_positions: bool=False,
+                                         rigify_ui: bool=False) -> "Rig":
         """Create an instance of Rig and populate it with information from the base mesh
         and from the armature which is expected to be the currently active object."""
 
@@ -171,7 +198,8 @@ class Rig:
         if empty:
             return rig
 
-        rig.rig_header["collections"] = [bcoll.name for bcoll in armature.data.collections]
+        armature_data = typing.cast(bpy.types.Armature, armature.data)
+        rig.rig_header["collections"] = [bcoll.name for bcoll in armature_data.collections]
 
         rig.add_data_bone_info()
 
@@ -179,7 +207,8 @@ class Rig:
             rig.match_bone_positions_with_strategies(fast=True)
 
         else:
-            assert bpy.context.active_object == armature
+            if bpy.context.active_object != armature:
+                raise ValueError("active_object must be the armature during rig load")
 
             bpy.ops.object.mode_set(mode='EDIT', toggle=False)
             rig.add_edit_bone_info()
@@ -192,7 +221,7 @@ class Rig:
 
             rig.cleanup_float_values()
 
-        if extra_bones := RigService.find_extra_bones(rig.armature_object):
+        if extra_bones := RigService.find_extra_bones(typing.cast(bpy.types.Object, rig.armature_object)):
             rig.rig_header["extra_bones"] = extra_bones
 
         if rigify_ui:
@@ -201,30 +230,32 @@ class Rig:
 
         return rig
 
-    def create_armature_and_fit_to_basemesh(self, for_developer=False, add_modifier=True):
+    def create_armature_and_fit_to_basemesh(self, for_developer: bool=False, add_modifier: bool=True) -> bpy.types.Object:
         """Use the information in the object to construct an armature and adjust it to fit the base mesh."""
 
         if self.parent:
             # Disable pose evaluation for parent so that any child-of constraints bind to rest pose.
-            self.parent.armature_object.data.pose_position = "REST"
+            parent_armature = typing.cast(bpy.types.Object, self.parent.armature_object)
+            typing.cast(bpy.types.Armature, parent_armature.data).pose_position = "REST"
 
         bpy.ops.object.armature_add(location=self.basemesh.location)
-        self.armature_object = bpy.context.object
+        armature_object = self.armature_object = typing.cast(bpy.types.Object, bpy.context.object)
 
         scale_factor = GeneralObjectProperties.get_value("scale_factor", entity_reference=self.basemesh)
-        GeneralObjectProperties.set_value("scale_factor", scale_factor, entity_reference=self.armature_object)
+        GeneralObjectProperties.set_value("scale_factor", scale_factor, entity_reference=armature_object)
 
         object_type = "Subrig" if self.parent else "Skeleton"
 
-        GeneralObjectProperties.set_value("object_type", object_type, entity_reference=self.armature_object)
+        GeneralObjectProperties.set_value("object_type", object_type, entity_reference=armature_object)
 
-        self.armature_object.show_in_front = True
-        self.armature_object.data.display_type = 'WIRE'
+        armature_data = typing.cast(bpy.types.Armature, armature_object.data)
+        armature_object.show_in_front = True
+        armature_data.display_type = 'WIRE'
 
         bpy.ops.object.mode_set(mode='EDIT', toggle=False)
 
-        for bone in self.armature_object.data.edit_bones:
-            self.armature_object.data.edit_bones.remove(bone)
+        for bone in armature_data.edit_bones:
+            armature_data.edit_bones.remove(bone)
 
         bpy.ops.object.mode_set(mode='OBJECT', toggle=False)  # To commit removal of bones
 
@@ -236,27 +267,28 @@ class Rig:
         if for_developer:
             self.save_strategies()
 
-        RigService.set_extra_bones(self.armature_object, self.rig_header.get("extra_bones"))
+        RigService.set_extra_bones(armature_object, self.rig_header.get("extra_bones"))
 
         if self.rig_header.get("rigify_ui"):
             from .rigging.rigifyhelpers.rigifyhelpers import RigifyHelpers
-            RigifyHelpers.load_rigify_ui(self.armature_object, self.rig_header["rigify_ui"])
+            RigifyHelpers.load_rigify_ui(armature_object, self.rig_header["rigify_ui"])
 
         bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
         if self.parent:
-            self.parent.armature_object.data.pose_position = "POSE"
+            parent_armature = typing.cast(bpy.types.Object, self.parent.armature_object)
+            typing.cast(bpy.types.Armature, parent_armature.data).pose_position = "POSE"
 
         if add_modifier:
             if self.parent:
                 RigService.ensure_armature_modifier(
-                    self.basemesh, self.parent.armature_object, subrig=self.armature_object)
+                    self.basemesh, self.parent.armature_object, subrig=armature_object)
             else:
-                RigService.ensure_armature_modifier(self.basemesh, self.armature_object)
+                RigService.ensure_armature_modifier(self.basemesh, armature_object)
 
-        return self.armature_object
+        return armature_object
 
-    def get_best_location_from_strategy(self, head_or_tail_info, use_default=True):
+    def get_best_location_from_strategy(self, head_or_tail_info: BoneEndInfo, use_default: bool=True) -> list[float] | None:
         strategy = head_or_tail_info["strategy"]
         location = None
         try:
@@ -286,23 +318,50 @@ class Rig:
             location = head_or_tail_info["default_position"]
         return location
 
-    def _align_roll_by_strategy(self, bone, bone_info):
-        self.apply_bone_roll_strategy(bone, bone_info.get("roll_strategy", None))
+    def _align_roll_by_strategy(self, bone: bpy.types.EditBone, bone_info: BoneInfo) -> None:
+        """Aligns the roll of a bone based on the given strategy"""
+        roll_strategy = bone_info.get("roll_strategy")
+        roll_reference_z = None
+
+        if roll_strategy == "ALIGN_Z_REFERENCE_Z":
+            roll_reference_z = bone_info.get("roll_reference_z", bone.z_axis)
+
+            # Ensure the type is list
+            try:
+                roll_reference_z = list(roll_reference_z)
+            except TypeError:
+                roll_reference_z = None
+
+            bone_info["roll_reference_z"] = roll_reference_z
+
+        if roll_strategy:
+            self.apply_bone_roll_strategy(bone, roll_strategy, roll_reference_z )
 
     @staticmethod
-    def apply_bone_roll_strategy(bone, roll_strategy):
+    def apply_bone_roll_strategy(bone: bpy.types.EditBone, roll_strategy: str, roll_reference_z: list[float] | None = None) -> None:
         matrix = None
 
         if roll_strategy == "ALIGN_Z_WORLD_Z":
             matrix = matrix_from_axis_pair(bone.y_axis, (0, 0, 1), 'z')
         elif roll_strategy == "ALIGN_X_WORLD_X":
             matrix = matrix_from_axis_pair(bone.y_axis, (1, 0, 0), 'x')
+        elif (
+            roll_strategy == "ALIGN_Z_REFERENCE_Z"
+            and roll_reference_z is not None
+            and isinstance(roll_reference_z, (list, tuple))
+            and len(roll_reference_z) == 3
+        ):
+            ref = Vector(roll_reference_z)
+            if ref.length > 1e-6:
+                ref.normalize()
+                bone.align_roll(ref)
 
         if matrix:
             bone.roll = bpy.types.Bone.AxisRollFromMatrix(matrix, axis=bone.y_axis)[1]
 
-    def create_bone_collections(self):
-        collections = self.armature_object.data.collections
+    def create_bone_collections(self) -> None:
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        collections = typing.cast(bpy.types.Armature, armature_object.data).collections
 
         if bcoll_names := self.rig_header.get("collections"):
             for bcoll in list(collections):
@@ -313,54 +372,66 @@ class Rig:
 
         collections.active_index = 0
 
-    def create_bones(self):
+    def create_bones(self) -> None:
         """Create the actual bones in the armature object."""
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
         bpy.ops.object.mode_set(mode='EDIT', toggle=False)
-        bones = self.armature_object.data.edit_bones
+        bones = typing.cast(bpy.types.Armature, armature_object.data).edit_bones
         for bone_name in self.rig_definition.keys():
             bone_info = self.rig_definition[bone_name]
             bone = bones.new(bone_name)
             bone.roll = bone_info["roll"]
-            bone.head = self.get_best_location_from_strategy(bone_info["head"])
-            bone.tail = self.get_best_location_from_strategy(bone_info["tail"])
+            bone.head = typing.cast(list[float], self.get_best_location_from_strategy(bone_info["head"]))
+            bone.tail = typing.cast(list[float], self.get_best_location_from_strategy(bone_info["tail"]))
 
-            self._align_roll_by_strategy(bone, bone_info)
+        # Apply roll strategies after head-tail positions have been set
+        for bone_name in self.rig_definition.keys():
+            bone_info = self.rig_definition[bone_name]
+            roll_bone = typing.cast(bpy.types.EditBone, RigService.find_edit_bone_by_name(bone_name, armature_object))
+            self._align_roll_by_strategy(roll_bone, bone_info)
 
         bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
-    def reposition_edit_bone(self, *, developer=False):
+    def reposition_edit_bone(self, *, developer: bool=False) -> None:
         """Reposition bones to fit the current state of the basemesh."""
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
         bpy.ops.object.mode_set(mode='EDIT', toggle=False)
         for bone_name in self.rig_definition.keys():
             bone_info = self.rig_definition[bone_name]
-            bone = RigService.find_edit_bone_by_name(bone_name, self.armature_object)
+            bone = RigService.find_edit_bone_by_name(bone_name, armature_object)
             if bone:
-                bone.head = self.get_best_location_from_strategy(bone_info["head"])
-                bone.tail = self.get_best_location_from_strategy(bone_info["tail"])
-                self._align_roll_by_strategy(bone, bone_info)
+                bone.head = typing.cast(list[float], self.get_best_location_from_strategy(bone_info["head"]))
+                bone.tail = typing.cast(list[float], self.get_best_location_from_strategy(bone_info["tail"]))
             else:
                 _LOG.warn("Tried to refit bone that did not exist in definition", bone_name)
                 _LOG.debug("Bone info is", bone_info)
                 _LOG.dump("Rig definition is", self.rig_definition)
+
+        # Apply roll strategies after head-tail positions have been set
+        for bone_name in self.rig_definition.keys():
+            bone_info = self.rig_definition[bone_name]
+            bone = RigService.find_edit_bone_by_name(bone_name, armature_object)
+            if bone:
+                self._align_roll_by_strategy(bone, bone_info)
 
         bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
         # Reset constraints if present
         updated = False
 
-        for pbone in self.armature_object.pose.bones:
+        for pbone in typing.cast(bpy.types.Pose, armature_object.pose).bones:
             for con in pbone.constraints:
                 if con.type == "STRETCH_TO":
-                    con.rest_length = 0
+                    typing.cast(bpy.types.StretchToConstraint, con).rest_length = 0
                     updated = True
                 elif con.type == "CHILD_OF":
-                    con.set_inverse_pending = True
+                    typing.cast(bpy.types.ChildOfConstraint, con).set_inverse_pending = True
                     updated = True
                 elif con.type == "ARMATURE":
                     # When refitting in Developer -> Save Rig, update bones and weights in
                     # Armature constraints referencing a vertex
                     if self.parent and developer:
-                        if self._rebuild_armature_con_vertex_targets(con):
+                        if self._rebuild_armature_con_vertex_targets(typing.cast(bpy.types.ArmatureConstraint, con)):
                             updated = True
 
         if updated:
@@ -374,26 +445,27 @@ class Rig:
             return None
 
     @staticmethod
-    def ensure_armature_constraint_vertex_index(con: bpy.types.ArmatureConstraint, vertex: int):
+    def ensure_armature_constraint_vertex_index(con: bpy.types.ArmatureConstraint, vertex: int) -> None:
         if match := re.fullmatch(r'^VERTEX:\s*(\d+)(\D.*|)$', con.name):
             con.name = f"VERTEX:{vertex}{match.group(2)}"
         else:
             con.name = f"VERTEX:{vertex} {con.name}"
 
-    def _rebuild_armature_con_vertex_targets(self, con: bpy.types.ArmatureConstraint):
+    def _rebuild_armature_con_vertex_targets(self, con: bpy.types.ArmatureConstraint) -> bool:
         vertex = self.get_armature_constraint_vertex_index(con)
 
         if vertex is not None:
-            weights = self.parent._find_vertex_weights(vertex)
+            parent = typing.cast("Rig", self.parent)
+            weights = parent._find_vertex_weights(vertex)
 
             if weights:
                 for tgt in list(con.targets):
-                    if tgt.target == self.parent.armature_object:
+                    if tgt.target == parent.armature_object:
                         con.targets.remove(tgt)
 
                 for name, weight in weights.items():
                     tgt = con.targets.new()
-                    tgt.target = self.parent.armature_object
+                    tgt.target = parent.armature_object
                     tgt.subtarget = name
                     tgt.weight = weight
 
@@ -401,14 +473,16 @@ class Rig:
 
         return False
 
-    def update_edit_bone_metadata(self):
+    def update_edit_bone_metadata(self) -> None:
         """Assign metadata fitting for the edit bones."""
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        armature_data = typing.cast(bpy.types.Armature, armature_object.data)
         bpy.ops.object.mode_set(mode='EDIT', toggle=False)
         for bone_name in self.rig_definition.keys():
             bone_info = self.rig_definition[bone_name]
-            bone = RigService.find_edit_bone_by_name(bone_name, self.armature_object)
+            bone = typing.cast(bpy.types.EditBone, RigService.find_edit_bone_by_name(bone_name, armature_object))
             if bone_info["parent"]:
-                bone.parent = RigService.find_edit_bone_by_name(bone_info["parent"], self.armature_object)
+                bone.parent = RigService.find_edit_bone_by_name(bone_info["parent"], armature_object)
             bone.use_connect = bone_info["use_connect"]
             bone.use_local_location = bone_info["use_local_location"]
             bone.use_inherit_rotation = bone_info["use_inherit_rotation"]
@@ -416,24 +490,28 @@ class Rig:
 
             if coll_names := bone_info.get("collections"):
                 for name in coll_names:
-                    self.armature_object.data.collections[name].assign(bone)
+                    armature_data.collections[name].assign(bone)
             else:
-                self.armature_object.data.collections.active.assign(bone)
+                typing.cast(bpy.types.BoneCollection, armature_data.collections.active).assign(bone)
 
             if "bendy_bone" in bone_info:
                 for field, val in bone_info["bendy_bone"].items():
                     if field in ("custom_handle_start", "custom_handle_end"):
-                        val = RigService.find_edit_bone_by_name(val, self.armature_object)
+                        val = RigService.find_edit_bone_by_name(val, armature_object)
 
                     setattr(bone, "bbone_" + field, val)
 
         bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
-    def rigify_metadata(self):
+    def rigify_metadata(self) -> None:
         """Assign bone meta data fitting for the pose bones."""
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
         bpy.ops.object.mode_set(mode='POSE', toggle=False)
         for bone_name, bone_info in self.rig_definition.items():
-            bone = RigService.find_pose_bone_by_name(bone_name, self.armature_object)
+            bone = typing.cast(bpy.types.PoseBone, RigService.find_pose_bone_by_name(bone_name, armature_object))
+            # One Any cast per bone rather than one per access, for the rigify properties; see the
+            # note at the top of the module.
+            bone_any = typing.cast(typing.Any, bone)
 
             bone.rotation_mode = bone_info.get("rotation_mode", "QUATERNION")
 
@@ -443,14 +521,14 @@ class Rig:
             rigify = bone_info["rigify"]
 
             if "rigify_type" in rigify and rigify["rigify_type"]:
-                bone.rigify_type = rigify["rigify_type"]
+                bone_any.rigify_type = rigify["rigify_type"]
 
             if "rigify_parameters" in rigify:
                 for key in rigify["rigify_parameters"].keys():
                     value = rigify["rigify_parameters"][key]
                     _LOG.debug("Will attempt to set bone.parameters.", key)
                     if key.endswith("_coll_refs"):
-                        ref_list = getattr(bone.rigify_parameters, key, None)
+                        ref_list = getattr(bone_any.rigify_parameters, key, None)
                         if ref_list is not None and hasattr(ref_list, 'add'):
                             for name in value:
                                 ref = ref_list.add()
@@ -459,13 +537,13 @@ class Rig:
                             _LOG.error("Rigify bone collection reference list not found.", key)
                     else:
                         try:
-                            setattr(bone.rigify_parameters, str(key), value)
+                            setattr(bone_any.rigify_parameters, str(key), value)
                         except AttributeError:
                             _LOG.error("Rigify bone parameter not found.", key)
 
         bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
-    def _apply_constraint_info(self, bone: bpy.types.PoseBone, info):
+    def _apply_constraint_info(self, bone: bpy.types.PoseBone, info: ConstraintInfo) -> None:
         con = bone.constraints.new(info["type"])
         con.name = info["name"]
 
@@ -482,16 +560,18 @@ class Rig:
                 tgt.weight = tgt_info["weight"]
 
             if parent_ref := info.get("target"):
-                assert parent_ref["strategy"] == "VERTEX"
+                if parent_ref["strategy"] != "VERTEX":
+                    raise ValueError(f"Expected strategy 'VERTEX', got {parent_ref['strategy']!r}")
 
                 vertex = parent_ref["vertex_index"]
 
                 # Just in case ensure the name reflects the result
                 self.ensure_armature_constraint_vertex_index(con, vertex)
 
-                for name, weight in self.parent._find_vertex_weights(vertex).items():
+                parent = typing.cast("Rig", self.parent)
+                for name, weight in parent._find_vertex_weights(vertex).items():
                     tgt = con.targets.new()
-                    tgt.target = self.parent.armature_object
+                    tgt.target = parent.armature_object
                     tgt.subtarget = name
                     tgt.weight = weight
 
@@ -499,14 +579,15 @@ class Rig:
             target = info.get("target", False)
 
             if target is True:
-                con.target = self.armature_object
+                typing.cast(typing.Any, con).target = self.armature_object
             elif isinstance(target, dict):
-                con.target = self._restore_parent_ref(bone, target, info)
+                typing.cast(typing.Any, con).target = self._restore_parent_ref(bone, target, info)
             else:
-                assert not target
+                if target:
+                    raise ValueError(f"Unexpected target value for constraint type: {target!r}")
 
         if info.get("space_object", False):
-            con.space_object = self.armature_object
+            typing.cast(typing.Any, con).space_object = self.armature_object
 
         skip_list = {"type", "name", "targets", "target", "space_object"}
 
@@ -515,19 +596,22 @@ class Rig:
                 setattr(con, field, val)
 
         if con.type == "CHILD_OF":
-            con.set_inverse_pending = True
+            typing.cast(bpy.types.ChildOfConstraint, con).set_inverse_pending = True
 
-    def _restore_parent_ref(self, bone: bpy.types.PoseBone, bone_ref: dict, info: dict):
-        assert self.parent
-        assert isinstance(bone_ref, dict)
+    def _restore_parent_ref(self, bone: bpy.types.PoseBone, bone_ref: ParentBoneRef, info: ConstraintInfo) -> bpy.types.Object:
+        if not self.parent:
+            raise ValueError("Cannot restore parent reference: rig has no parent")
+        if not isinstance(bone_ref, dict):
+            raise TypeError(f"bone_ref must be a dict, got {type(bone_ref).__name__}")
 
-        arm = self.parent.armature_object
+        arm = typing.cast(bpy.types.Object, self.parent.armature_object)
         strategy = bone_ref["strategy"]
 
         if strategy is None:
             return arm
 
-        assert strategy == "JOINTS"
+        if strategy != "JOINTS":
+            raise ValueError(f"Unsupported parent ref strategy: {strategy!r}")
 
         joint_head = bone_ref["joint_head"]
         joint_tail = bone_ref["joint_tail"]
@@ -545,7 +629,8 @@ class Rig:
                     bones = org_bones
 
             if len(bones) > 1:
-                def_bones = [item for item in bones if arm.pose.bones[item[0]].bone.use_deform]
+                arm_pose = typing.cast(bpy.types.Pose, arm.pose)
+                def_bones = [item for item in bones if arm_pose.bones[item[0]].bone.use_deform]
                 if def_bones:
                     bones = def_bones
 
@@ -561,7 +646,7 @@ class Rig:
 
         return arm
 
-    def _select_parent_chain_bones(self, chains, pos, head_tail):
+    def _select_parent_chain_bones(self, chains: list[BoneChain], pos: Vector, head_tail: float | None) -> list[ParentChainBone]:
         """Select the best bone from each chain connecting two joints."""
 
         single = [(chain[0], head_tail, chain) for chain in chains if len(chain) == 1]
@@ -569,12 +654,17 @@ class Rig:
         if single:
             return single
 
-        return [self._select_parent_chain_bone(chain, pos, head_tail) for chain in chains]
+        # _select_parent_chain_bone() answers None for a head_tail outside 0..1, which blender's own
+        # clamping rules out for a live constraint but a malformed rig file can still carry. The
+        # callers below assume a bone was picked for every chain.
+        return typing.cast(list[ParentChainBone],
+                           [self._select_parent_chain_bone(chain, pos, head_tail) for chain in chains])
 
-    def _select_parent_chain_bone(self, chain, pos, head_tail):
+    def _select_parent_chain_bone(self, chain: BoneChain, pos: Vector, head_tail: float | None) -> ParentChainBone | None:
         """Select the best bone from a chain connecting two joints."""
 
-        pose_bones = self.parent.armature_object.pose.bones
+        parent = typing.cast("Rig", self.parent)
+        pose_bones = typing.cast(bpy.types.Pose, typing.cast(bpy.types.Object, parent.armature_object).pose).bones
 
         if head_tail is not None:
             # Select bone based on head_tail
@@ -592,7 +682,7 @@ class Rig:
             return distances[0][0], None, chain
 
     @staticmethod
-    def _distance_point_bone(point: Vector, bone: bpy.types.Bone):
+    def _distance_point_bone(point: Vector, bone: bpy.types.Bone) -> float:
         """Calculates the distance from a point to a Bone."""
         from mathutils.geometry import intersect_point_line
 
@@ -605,14 +695,18 @@ class Rig:
 
         return (point - closest).length
 
-    def _find_parent_joint_chains_split(self, joint_head, joint_tail, head_tail):
+    def _find_parent_joint_chains_split(self, joint_head: str, joint_tail: str,
+                                        head_tail: float | None) -> tuple[list[BoneChain], float | None]:
         """Find chains of bones connecting two joint cubes, with automatic joint unsplitting."""
 
-        def adjust_head_tail(cur_head_tail, head, mid, tail, replace_head):
+        parent = typing.cast("Rig", self.parent)
+
+        def adjust_head_tail(cur_head_tail: float | None, head: str, mid: str, tail: str,
+                             replace_head: bool) -> float | None:
             if cur_head_tail is not None:
-                head_pos = Vector(self.parent.position_info["cubes"][head])
-                mid_pos = Vector(self.parent.position_info["cubes"][mid])
-                tail_pos = Vector(self.parent.position_info["cubes"][tail])
+                head_pos = Vector(parent.position_info["cubes"][head])
+                mid_pos = Vector(parent.position_info["cubes"][mid])
+                tail_pos = Vector(parent.position_info["cubes"][tail])
 
                 len_a = (head_pos - mid_pos).length
                 len_b = (tail_pos - mid_pos).length
@@ -649,17 +743,22 @@ class Rig:
 
         return chains, head_tail
 
-    def _find_parent_joint_chains(self, joint_head: str, joint_tail: str):
+    def _find_parent_joint_chains(self, joint_head: str, joint_tail: str) -> list[BoneChain]:
         """Find chains of bones connecting two joint cubes."""
-        chains = []
+        chains: list[BoneChain] = []
 
-        for name, bone_info in self.parent.rig_definition.items():
+        parent = typing.cast("Rig", self.parent)
+        parent_pose = typing.cast(bpy.types.Pose, typing.cast(bpy.types.Object, parent.armature_object).pose)
+
+        for name, bone_info in parent.rig_definition.items():
             if bone_info["tail"]["strategy"] == "CUBE" and bone_info["tail"]["cube_name"] == joint_tail:
                 chain = []
 
-                cur_bone = self.parent.armature_object.pose.bones[name].bone
+                cur_bone = parent_pose.bones[name].bone
 
-                while bone_info := self.parent.rig_definition.get(name):
+                # parent is rebound to cur_bone.parent at the bottom of this loop, so on a second
+                # pass the attribute is read off a Bone rather than off the parent Rig.
+                while bone_info := parent.rig_definition.get(name):  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
                     chain.append(name)
 
                     if bone_info["head"]["strategy"] == "CUBE" and bone_info["head"]["cube_name"] == joint_head:
@@ -677,26 +776,34 @@ class Rig:
 
         return chains
 
-    def save_strategies(self, refit=False):
-        """Save strategy data in the pose bones for development."""
+    def save_strategies(self, refit: bool=False) -> None:
+        """Save strategy data in the pose and edit bones for development."""
+        from ..ui.operations.boneops import BoneOpsArmatureProperties, BoneOpsBoneProperties, BoneOpsEditBoneProperties
 
-        from ..ui.boneops import BoneOpsArmatureProperties, BoneOpsBoneProperties
-        BoneOpsArmatureProperties.set_value("developer_mode", True, entity_reference=self.armature_object.data)
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        BoneOpsArmatureProperties.set_value("developer_mode", True, entity_reference=armature_object.data)
 
         for bone_name, bone_info in self.rig_definition.items():
-            bone = RigService.find_pose_bone_by_name(bone_name, self.armature_object).bone
+            bone = typing.cast(bpy.types.PoseBone, RigService.find_pose_bone_by_name(bone_name, armature_object)).bone
 
             self.assign_bone_end_strategy(bone, bone_info["head"], False)
             self.assign_bone_end_strategy(bone, bone_info["tail"], True)
 
-            if not refit:
-                roll_strategy = bone_info.get("roll_strategy", None)
-                if roll_strategy:
-                    BoneOpsBoneProperties.set_value("roll_strategy", roll_strategy, entity_reference=bone)
+        if not refit:
+            bpy.ops.object.mode_set(mode='EDIT', toggle=False)
+            for bone_name in self.rig_definition.keys():
+                bone_info = self.rig_definition[bone_name]
+                bone = RigService.find_edit_bone_by_name(bone_name, armature_object)
+                roll_strategy = bone_info.get("roll_strategy", "")
+                BoneOpsEditBoneProperties.set_value("roll_strategy", roll_strategy, entity_reference=bone)
+                roll_reference_z = bone_info.get("roll_reference_z", (0.0, 0.0, 0.0))
+                BoneOpsEditBoneProperties.set_value("roll_reference_z", roll_reference_z, entity_reference=bone)
+            bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
     @staticmethod
-    def assign_bone_end_strategy(bone, info, is_tail: bool, *, force=False, lock: bool | None=None):
-        from ..ui.boneops import BoneOpsBoneProperties, BoneOpsEditBoneProperties
+    def assign_bone_end_strategy(bone: bpy.types.Bone | bpy.types.EditBone, info: BoneEndInfo, is_tail: bool, *,
+                                 force: bool=False, lock: bool | None=None) -> None:
+        from ..ui.operations.boneops import BoneOpsBoneProperties, BoneOpsEditBoneProperties
 
         properties = BoneOpsEditBoneProperties if isinstance(bone, bpy.types.EditBone) else BoneOpsBoneProperties
         prefix = "tail" if is_tail else "head"
@@ -723,9 +830,9 @@ class Rig:
         properties.set_value(prefix + "_offset", offset, entity_reference=bone)
 
     @staticmethod
-    def get_bone_end_strategy(bone, is_tail):
+    def get_bone_end_strategy(bone: bpy.types.Bone | bpy.types.EditBone, is_tail: bool) -> tuple[BoneEndInfo | None, bool]:
         """Retrieve head or tail strategy settings from a bone."""
-        from ..ui.boneops import BoneOpsBoneProperties, BoneOpsEditBoneProperties
+        from ..ui.operations.boneops import BoneOpsBoneProperties, BoneOpsEditBoneProperties
 
         properties = BoneOpsEditBoneProperties if isinstance(bone, bpy.types.EditBone) else BoneOpsBoneProperties
         prefix = "tail" if is_tail else "head"
@@ -737,7 +844,7 @@ class Rig:
             if properties.get_value(prefix + "_strategy_lock", entity_reference=bone):
                 force = True
 
-            info = {"strategy": strategy}
+            info: BoneEndInfo = {"strategy": strategy}
 
             if strategy == "CUBE":
                 info["cube_name"] = properties.get_value(prefix + "_cube_name", entity_reference=bone)
@@ -757,7 +864,7 @@ class Rig:
         except KeyError:
             return None, False
 
-    def list_unmatched_bones(self):
+    def list_unmatched_bones(self) -> list[str]:
         """List bones which are still marked as using the DEFAULT positioning strategy."""
         unmatched_bone_names = []
 
@@ -774,17 +881,17 @@ class Rig:
 
         return unmatched_bone_names
 
-    def move_basemesh_if_needed(self):
+    def move_basemesh_if_needed(self) -> None:
         """Move basemesh so it has feet on ground and apply this transform."""
         self.basemesh.location = (0.0, 0.0, 0.0)
-        for vertex in self.basemesh.data.vertices:
+        for vertex in typing.cast(bpy.types.Mesh, self.basemesh.data).vertices:
             if vertex.co[2] < self.lowest_point and vertex.index < 13380:
                 self.lowest_point = vertex.co[2]
         if self.lowest_point < -0.0001:
             self.basemesh.location[2] = abs(self.lowest_point)
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-    def build_basemesh_position_info(self, take_shape_keys_into_account=True):
+    def build_basemesh_position_info(self, take_shape_keys_into_account: bool=True) -> None:
         """Populate the position information hash with positions from the base mesh.
         We will here also extract and store vertex positions and store them in the hash,
         as these positions may be influenced by shape keys."""
@@ -792,17 +899,19 @@ class Rig:
         self.position_info = dict()
 
         self.position_info["cubes"] = dict()
-        cubes = self.position_info["cubes"]
+        cubes: dict[str, list[float]] = self.position_info["cubes"]
 
         self.position_info["vertices"] = []
-        vertices = self.position_info["vertices"]
+        vertices: list[list[float]] = self.position_info["vertices"]
 
-        cube_groups = dict()
-        group_index_to_name = dict()
+        cube_groups: dict[str, list[list[float]]] = dict()
+        group_index_to_name: dict[int, str] = dict()
 
         basemesh: bpy.types.Object = self.basemesh
 
-        assert isinstance(basemesh.data, bpy.types.Mesh)
+        if not isinstance(basemesh.data, bpy.types.Mesh):
+            raise TypeError(f"basemesh.data must be a Mesh, got {type(basemesh.data).__name__}")
+        mesh = typing.cast(bpy.types.Mesh, basemesh.data)
 
         if self.parent:
             # Copy cube data from the parent rig if present
@@ -816,27 +925,29 @@ class Rig:
                     cube_groups[name] = []
                     group_index_to_name[idx] = name
 
-        coords = basemesh.data.vertices
+        coords = mesh.vertices
         shape_key = None
         key_name = None
 
-        if take_shape_keys_into_account and basemesh.data.shape_keys and basemesh.data.shape_keys.key_blocks and len(basemesh.data.shape_keys.key_blocks) > 0:
+        if take_shape_keys_into_account and mesh.shape_keys and mesh.shape_keys.key_blocks and len(mesh.shape_keys.key_blocks) > 0:
             if basemesh.mode == "EDIT":
                 if not basemesh.use_shape_key_edit_mode or basemesh.show_only_shape_key:
                     basemesh.use_shape_key_edit_mode = True
                     basemesh.show_only_shape_key = False
                     bpy.context.view_layer.update()
 
-                bm = bmesh.from_edit_mesh(basemesh.data)
+                bm = bmesh.from_edit_mesh(mesh)
                 coords = bm.verts
             else:
                 from ..services import TargetService
-                key_name = "temporary_fit_rig_key." + str(random.randrange(1000, 9999))
+                key_name = "temporary_fit_rig_key." + str(secrets.randbelow(9000) + 1000)
                 shape_key = TargetService.create_shape_key(basemesh, key_name, also_create_basis=True, create_from_mix=True)
-                coords = shape_key.data
+                # ShapeKey.data is declared bpy_prop_collection[UnknownType], so its points have no .co
+                # as far as the checker is concerned.
+                coords = typing.cast("bpy.types.bpy_prop_collection[bpy.types.ShapeKeyPoint]", shape_key.data)
 
-        for vertex in basemesh.data.vertices:
-            vertex_coords = list(coords[vertex.index].co)  # Either actual vertex or the corresponding shape key point
+        for vertex in mesh.vertices:
+            vertex_coords = list(typing.cast(typing.Iterable[float], coords[vertex.index].co))  # Either actual vertex or the corresponding shape key point
             vertices.append(vertex_coords)
             for group in vertex.groups:
                 idx = int(group.group)
@@ -859,23 +970,25 @@ class Rig:
                 sum_pos[n] = sum_pos[n] / float(len(group))
             cubes[name] = sum_pos
 
-    def add_data_bone_info(self):
+    def add_data_bone_info(self) -> None:
         """Extract bone information from the bone data."""
 
-        assert self.armature_object.mode != 'EDIT'
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        if armature_object.mode == 'EDIT':
+            raise ValueError("armature_object must not be in EDIT mode for add_data_bone_info()")
 
-        for bone in self.armature_object.data.bones:
-            bone_info = dict()
+        for bone in typing.cast(bpy.types.Armature, armature_object.data).bones:
+            bone_info: BoneInfo = dict()
             bone_info["parent"] = ""
             if bone.parent:
                 bone_info["parent"] = bone.parent.name
 
             bone_info["head"] = dict()
-            bone_info["head"]["default_position"] = list(bone.head_local)
+            bone_info["head"]["default_position"] = list(typing.cast(typing.Iterable[float], bone.head_local))
             bone_info["head"]["strategy"] = "DEFAULT"
 
             bone_info["tail"] = dict()
-            bone_info["tail"]["default_position"] = list(bone.tail_local)
+            bone_info["tail"]["default_position"] = list(typing.cast(typing.Iterable[float], bone.tail_local))
             bone_info["tail"]["strategy"] = "DEFAULT"
 
             bone_info["use_connect"] = bone.use_connect
@@ -890,20 +1003,35 @@ class Rig:
 
             self.rig_definition[bone.name] = bone_info
 
-    def add_edit_bone_info(self):
+    def add_edit_bone_info(self) -> None:
         """Extract bone information from the edit bones."""
+        from ..ui.operations.boneops import BoneOpsEditBoneProperties
 
-        assert self.armature_object.mode == 'EDIT'
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        if armature_object.mode != 'EDIT':
+            raise ValueError(f"armature_object must be in EDIT mode for add_edit_bone_info(), current mode: {armature_object.mode!r}")
+        properties = BoneOpsEditBoneProperties
 
-        for bone in self.armature_object.data.edit_bones:
+        for bone in typing.cast(bpy.types.Armature, armature_object.data).edit_bones:
             bone_info = self.rig_definition[bone.name]
 
             # Info that must be accessed in Edit mode
             bone_info["roll"] = bone.roll
 
+            roll_strategy = properties.get_value("roll_strategy", entity_reference=bone)
+            if roll_strategy:
+                bone_info["roll_strategy"] = roll_strategy
+
+                if roll_strategy == "ALIGN_Z_REFERENCE_Z":
+                    ref_z = properties.get_value("roll_reference_z", entity_reference=bone)
+                    if ref_z:
+                        bone_info["roll_reference_z"] = list(ref_z)
+                    else:
+                        bone_info["roll_reference_z"] = list(typing.cast(typing.Iterable[float], bone.z_axis))
+
         _LOG.dump("rig_definition after edit bones", self.rig_definition)
 
-    def cleanup_float_values(self):
+    def cleanup_float_values(self) -> None:
         """Round some float values in definitions to reduce noise on re-save"""
 
         # Remove extra digits and negative zero
@@ -917,8 +1045,10 @@ class Rig:
             if "offset" in info["tail"]:
                 info["tail"]["offset"] = list(map(clean, info["tail"]["offset"]))
             info["roll"] = clean(info["roll"])
+            if "roll_reference_z" in info:
+                info["roll_reference_z"] = list(map(clean, info["roll_reference_z"]))
 
-    def _encode_bbone_info(self, bone):
+    def _encode_bbone_info(self, bone: bpy.types.Bone) -> BendyBoneInfo:
         defaults = {
             "segments": 1,
             "mapping_mode": "STRAIGHT",
@@ -930,7 +1060,7 @@ class Rig:
             "easein": 1.0, "easeout": 1.0,
         }
 
-        info = {}
+        info: BendyBoneInfo = {}
 
         for field, defval in defaults.items():
             val = getattr(bone, "bbone_" + field)
@@ -938,19 +1068,21 @@ class Rig:
             if field in ("custom_handle_start", "custom_handle_end"):
                 val = val.name if val else None
             elif isinstance(val, bpy.types.bpy_prop_array):
-                val = list(val)
+                val = list(typing.cast(typing.Iterable, val))
 
             if val != defval:
                 info[field] = val
 
         return info
 
-    def add_pose_bone_info(self):
+    def add_pose_bone_info(self) -> None:
         """Extract information from the pose bones."""
 
-        assert self.armature_object.mode != 'EDIT'
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        if armature_object.mode == 'EDIT':
+            raise ValueError("armature_object must not be in EDIT mode for add_pose_bone_info()")
 
-        for bone in self.armature_object.pose.bones:
+        for bone in typing.cast(bpy.types.Pose, armature_object.pose).bones:
             bone_info = self.rig_definition[bone.name]
 
             if bone.rotation_mode != "QUATERNION":
@@ -964,12 +1096,15 @@ class Rig:
             bone_info["rigify"] = dict()
             rigify = bone_info["rigify"]
 
-            if hasattr(bone, "rigify_parameters") and len(dict(bone.rigify_parameters)) > 0:
+            # rigify_parameters / rigify_type are added by the Rigify add-on and are not in the bpy stubs
+            bone_any = typing.cast(typing.Any, bone)
+
+            if hasattr(bone, "rigify_parameters") and len(dict(bone_any.rigify_parameters)) > 0:
                 rigify["rigify_parameters"] = dict()
-                _LOG.dump("rigify_parameters", dict(bone.rigify_parameters))
-                for param in bone.rigify_parameters.keys():
+                _LOG.dump("rigify_parameters", dict(bone_any.rigify_parameters))
+                for param in bone_any.rigify_parameters.keys():
                     param_name = str(param)
-                    value = getattr(bone.rigify_parameters, param_name)
+                    value = getattr(bone_any.rigify_parameters, param_name)
                     _LOG.debug("param: ", (param_name, value, type(value)))
 
                     if isinstance(value, float) or isinstance(value, int) or isinstance(value, str):
@@ -983,11 +1118,11 @@ class Rig:
                             props.append(prop)
                         rigify["rigify_parameters"][param_name] = props
 
-            if hasattr(bone, "rigify_type") and bone.rigify_type:
-                rigify["rigify_type"] = str(bone.rigify_type)
+            if hasattr(bone, "rigify_type") and bone_any.rigify_type:
+                rigify["rigify_type"] = str(bone_any.rigify_type)
 
-    def _encode_constraint_info(self, bone, con):
-        info: dict[str, typing.Any] = {
+    def _encode_constraint_info(self, bone: bpy.types.PoseBone, con: bpy.types.Constraint) -> ConstraintInfo:
+        info: ConstraintInfo = {
             "type": con.type,
             "name": con.name,
         }
@@ -997,11 +1132,12 @@ class Rig:
 
         # Handle targets - only support targeting the armature
         if con.type == "ARMATURE":
+            armature_con = typing.cast(bpy.types.ArmatureConstraint, con)
             targets = info["targets"] = []
             weights = {}
 
             if self.parent:
-                vertex = self.get_armature_constraint_vertex_index(con)
+                vertex = self.get_armature_constraint_vertex_index(armature_con)
                 if vertex is not None:
                     weights = self.parent._find_vertex_weights(vertex)
                     if not weights:
@@ -1009,8 +1145,8 @@ class Rig:
                     else:
                         info["target"] = {"strategy": "VERTEX", "vertex_index": vertex}
 
-            for tgt in con.targets:
-                if weights and tgt.target == self.parent.armature_object:
+            for tgt in armature_con.targets:
+                if weights and tgt.target == typing.cast("Rig", self.parent).armature_object:
                     continue
 
                 tgt_info = {"subtarget": tgt.subtarget, "weight": tgt.weight}
@@ -1034,12 +1170,12 @@ class Rig:
 
         if getattr(con, "space_object", None) == self.armature_object:
             info["space_object"] = True
-            info["space_subtarget"] = con.space_subtarget
+            info["space_subtarget"] = typing.cast(typing.Any, con).space_subtarget
 
         return info
 
     @staticmethod
-    def _add_constraint_properties(con, info):
+    def _add_constraint_properties(con: bpy.types.Constraint, info: ConstraintInfo) -> None:
         defaults = {
             'owner_space': 'WORLD', 'target_space': 'WORLD',
             'mute': False, 'influence': 1.0,
@@ -1062,7 +1198,7 @@ class Rig:
                 cur_value = getattr(con, prop.identifier, None)
 
                 if isinstance(cur_value, array_types):
-                    value = list(cur_value)
+                    value = list(typing.cast(typing.Iterable, cur_value))
 
                 if prop.identifier in defaults and cur_value == defaults[prop.identifier]:
                     continue
@@ -1070,12 +1206,14 @@ class Rig:
                 if not isinstance(cur_value, bad_types):
                     info[prop.identifier] = cur_value
 
-    def _encode_constraint_parent_ref(self, bone, subtarget, info=None):
+    def _encode_constraint_parent_ref(self, bone: bpy.types.PoseBone, subtarget: str | None,
+                                      info: ConstraintInfo | None=None) -> ParentBoneRef:
         if not subtarget:
             return {"strategy": None}
 
-        head_joint, prefix = self.parent._list_parents_until_joint(subtarget)
-        tail_joint, suffix = self.parent._list_children_until_joint(subtarget)
+        parent = typing.cast("Rig", self.parent)
+        head_joint, prefix = parent._list_parents_until_joint(subtarget)
+        tail_joint, suffix = parent._list_children_until_joint(subtarget)
 
         if not head_joint or not tail_joint:
             self.bad_constraint_targets.add(bone.name)
@@ -1084,8 +1222,8 @@ class Rig:
         bone_chain = [*prefix, subtarget, *suffix]
 
         # Recalculate head-tail slider according to the position in the chain
-        if len(bone_chain) > 1 and "head_tail" in info:
-            pose_bones = self.parent.armature_object.pose.bones
+        if len(bone_chain) > 1 and "head_tail" in (info := typing.cast(ConstraintInfo, info)):
+            pose_bones = typing.cast(bpy.types.Pose, typing.cast(bpy.types.Object, parent.armature_object).pose).bones
 
             lens = [0, *accumulate(pose_bones[name].bone.length for name in bone_chain)]
             index = len(prefix)
@@ -1094,7 +1232,7 @@ class Rig:
 
         return {"strategy": "JOINTS", "joint_head": head_joint, "joint_tail": tail_joint}
 
-    def _list_parents_until_joint(self, cur_name):
+    def _list_parents_until_joint(self, cur_name: str) -> tuple[str | None, list[str]]:
         bone_info = self.rig_definition.get(cur_name, None)
 
         if not bone_info:
@@ -1103,7 +1241,8 @@ class Rig:
         if bone_info["head"]["strategy"] == "CUBE":
             return bone_info["head"]["cube_name"], []
 
-        cur_bone = self.armature_object.pose.bones[cur_name]
+        pose_bones = typing.cast(bpy.types.Pose, typing.cast(bpy.types.Object, self.armature_object).pose).bones
+        cur_bone = pose_bones[cur_name]
         parent = cur_bone.parent
 
         if not parent or (parent.bone.tail_local - cur_bone.bone.head_local).length > _MAX_DIST_TO_CONSIDER_EXACT:
@@ -1113,7 +1252,7 @@ class Rig:
 
         return joint, prefix + [parent.name]
 
-    def _list_children_until_joint(self, cur_name):
+    def _list_children_until_joint(self, cur_name: str) -> tuple[str | None, list[str]]:
         bone_info = self.rig_definition.get(cur_name, None)
 
         if not bone_info:
@@ -1122,9 +1261,10 @@ class Rig:
         if bone_info["tail"]["strategy"] == "CUBE":
             return bone_info["tail"]["cube_name"], []
 
-        cur_bone = self.armature_object.pose.bones[cur_name].bone
+        pose_bones = typing.cast(bpy.types.Pose, typing.cast(bpy.types.Object, self.armature_object).pose).bones
+        cur_bone = pose_bones[cur_name].bone
         children = cur_bone.children
-        candidates = []
+        candidates: list[tuple[str, list[str]]] = []
 
         for child in children:
             if (child.head_local - cur_bone.tail_local).length < _MAX_DIST_TO_CONSIDER_EXACT:
@@ -1138,15 +1278,16 @@ class Rig:
         joint, suffix = sorted(candidates, key=lambda x: len(x[1]))[0]
         return joint, suffix
 
-    def _find_vertex_weights(self, vertex):
+    def _find_vertex_weights(self, vertex: int) -> VertexWeights:
         """Retrieve deform weights associated with the given mesh vertex."""
 
         mesh_obj: bpy.types.Object = self.basemesh
         mesh = mesh_obj.data
-        assert isinstance(mesh, bpy.types.Mesh)
+        if not isinstance(mesh, bpy.types.Mesh):
+            raise TypeError(f"basemesh.data must be a Mesh, got {type(mesh).__name__}")
 
-        def_bones = set(RigService.get_deform_group_bones(self.armature_object))
-        weights = {}
+        def_bones = set(RigService.get_deform_group_bones(typing.cast(bpy.types.Object, self.armature_object)))
+        weights: VertexWeights = {}
 
         if 0 <= vertex < len(mesh.vertices):
             vertex_groups = mesh_obj.vertex_groups
@@ -1159,7 +1300,7 @@ class Rig:
 
         return weights
 
-    def match_bone_positions_with_strategies(self, fast=False):
+    def match_bone_positions_with_strategies(self, fast: bool=False) -> None:
         """Try to find out bone positions matching joint cubes."""
 
         for bone_name in self.rig_definition.keys():
@@ -1168,7 +1309,7 @@ class Rig:
             self._match_position_to_strategy(bone_info["head"], fast)
             self._match_position_to_strategy(bone_info["tail"], fast)
 
-    def _match_position_to_strategy(self, position_info, fast):
+    def _match_position_to_strategy(self, position_info: BoneEndInfo, fast: bool) -> None:
         pos = position_info["default_position"]
 
         best_dist = 100.0
@@ -1180,13 +1321,13 @@ class Rig:
 
         if cube_name is not None:
             strategy = "CUBE"
-            best_dist = cube_dist
+            best_dist = typing.cast(float, cube_dist)
 
         if vertex_idx is not None:
             # Prefer exact vertex to a non-exact cube
-            if not strategy or vertex_dist < exact_threshold < cube_dist:
+            if not strategy or typing.cast(float, vertex_dist) < exact_threshold < typing.cast(float, cube_dist):
                 strategy = "VERTEX"
-                best_dist = vertex_dist
+                best_dist = typing.cast(float, vertex_dist)
 
         # Use mean to replace non-exact vertices if better
         if strategy != "CUBE" and best_dist > exact_threshold and not fast:
@@ -1207,10 +1348,11 @@ class Rig:
             elif strategy == "VERTEX":
                 position_info["vertex_index"] = vertex_idx
 
-    def restore_saved_strategies(self):
+    def restore_saved_strategies(self) -> None:
         """Check if the saved strategies are better and apply them."""
 
-        for bone in self.armature_object.data.bones:
+        armature_object = typing.cast(bpy.types.Object, self.armature_object)
+        for bone in typing.cast(bpy.types.Armature, armature_object.data).bones:
             bone_info = self.rig_definition[bone.name]
 
             roll_strategy = bone.get("mpfb_roll_strategy", None)
@@ -1224,7 +1366,8 @@ class Rig:
             self._restore_end_strategy(bone, bone_info, False)
             self._restore_end_strategy(bone, bone_info, True)
 
-    def get_bone_strategy_and_location(self, bone, is_tail):
+    def get_bone_strategy_and_location(self, bone: bpy.types.Bone | bpy.types.EditBone,
+                                       is_tail: bool) -> tuple[BoneEndInfo | None, list[float] | None]:
         info, _force = self.get_bone_end_strategy(bone, is_tail)
         pos = None
 
@@ -1233,7 +1376,7 @@ class Rig:
 
         return info, pos
 
-    def _restore_end_strategy(self, bone, bone_info, is_tail):
+    def _restore_end_strategy(self, bone: bpy.types.Bone | bpy.types.EditBone, bone_info: BoneInfo, is_tail: bool) -> None:
         field = "tail" if is_tail else "head"
         saved_head, force = self.get_bone_end_strategy(bone, is_tail)
 
@@ -1259,7 +1402,7 @@ class Rig:
             saved_head["default_position"] = true_pos
             bone_info[field] = saved_head
 
-    def _distance(self, pos1, pos2):
+    def _distance(self, pos1: list[float] | None, pos2: list[float] | None) -> float:
         if pos1 is None:
             raise ValueError("Pos 1 in _distance is None")
 
@@ -1280,7 +1423,7 @@ class Rig:
             sqr_pos[i] = abs(pos1[i] - pos2[i]) * abs(pos1[i] - pos2[i])
         return math.sqrt(sqr_pos[0] + sqr_pos[1] + sqr_pos[2])
 
-    def _get_cube_tree(self):
+    def _get_cube_tree(self) -> tuple[KDTree, list[str]] | tuple[None, None]:
         if "cubes_tree" in self.position_info:
             return self.position_info["cubes_tree"], self.position_info["cubes_list"]
 
@@ -1299,28 +1442,35 @@ class Rig:
 
         return cube_tree, cube_list
 
-    def find_closest_cube(self, pos, max_allowed_dist: float | None=_MAX_ALLOWED_DIST
+    def find_closest_cube(self, pos: Vector | typing.Sequence[float], max_allowed_dist: float | None=_MAX_ALLOWED_DIST
                           ) -> tuple[str, float] | tuple[None, None]:
         cube_tree, cube_list = self._get_cube_tree()
 
         if not cube_tree:
             return None, None
 
+        # See find_closest_vertex: the mathutils.kdtree stub types find()'s argument and result
+        # strictly, so the tree is treated dynamically. _get_cube_tree() returns the tree and the
+        # name list together, so the list is present whenever the tree is.
+        tree = typing.cast(typing.Any, cube_tree)
+        cube_list = typing.cast(list[str], cube_list)
+
         # Find the closest point
-        _cube_pos, index, dist = cube_tree.find(pos)
+        _cube_pos, index, dist = tree.find(pos)
 
         if max_allowed_dist is None or dist < max_allowed_dist:
             return cube_list[index], dist
 
         return None, None
 
-    def _get_vertex_tree(self):
+    def _get_vertex_tree(self) -> KDTree:
         if "vertices_tree" in self.position_info:
             return self.position_info["vertices_tree"]
 
         vertices = self.position_info["vertices"]
 
-        assert len(vertices) > 0
+        if len(vertices) == 0:
+            raise ValueError("Cannot build vertex KDTree: vertices list is empty")
 
         vertex_tree = self.position_info["vertices_tree"] = KDTree(len(vertices))
 
@@ -1331,9 +1481,11 @@ class Rig:
 
         return vertex_tree
 
-    def find_closest_vertex(self, pos, max_allowed_dist: float | None=_MAX_ALLOWED_DIST
+    def find_closest_vertex(self, pos: Vector | typing.Sequence[float], max_allowed_dist: float | None=_MAX_ALLOWED_DIST
                             ) -> tuple[int, float] | tuple[None, None]:
-        vertex_tree = self._get_vertex_tree()
+        # The mathutils.kdtree stub types find()'s argument and result strictly; treat the tree
+        # dynamically since pos may be a Vector and find() returns optionals.
+        vertex_tree = typing.cast(typing.Any, self._get_vertex_tree())
 
         # Find the closest point
         _vertex, idx, dist = vertex_tree.find(pos)
@@ -1343,7 +1495,7 @@ class Rig:
 
         return None, None
 
-    def _get_vertex_total_height(self):
+    def _get_vertex_total_height(self) -> float:
         if "vertices_mean_scale" in self.position_info:
             return self.position_info["vertices_mean_scale"]
 
@@ -1365,8 +1517,10 @@ class Rig:
 
         return total_height
 
-    def find_closest_vertex_mean(self, pos, max_allowed_dist=_MAX_ALLOWED_DIST * 2, search_radius=None):
-        vertex_tree = self._get_vertex_tree()
+    def find_closest_vertex_mean(self, pos: Vector | typing.Sequence[float], max_allowed_dist: float=_MAX_ALLOWED_DIST * 2,
+                                 search_radius: float | None=None) -> tuple[list[int] | None, float]:
+        # See find_closest_vertex: the kdtree stub is too strict for the Vector math below.
+        vertex_tree = typing.cast(typing.Any, self._get_vertex_tree())
 
         # Only include verts which are less than 15% of the total height
         # away from the position along any axis.
@@ -1380,7 +1534,7 @@ class Rig:
         # same weight as a zero distance pair with mean at max_allowed_dist.
         length_penalty = _MEAN_LENGTH_PENALTY * max_allowed_dist / (max_axis_distance * 2)
 
-        pos = Vector(pos)
+        pos = Vector(typing.cast(typing.Sequence[float], pos))
 
         best_match_weight = max_allowed_dist + length_penalty * max_axis_distance * 2
         best_match_idxs = None
@@ -1416,16 +1570,22 @@ class Rig:
         return best_match_idxs, best_match_dist
 
 
-def matrix_from_axis_pair(y_axis, other_axis, axis_name):
-    assert axis_name in 'xz'
+def matrix_from_axis_pair(y_axis: Vector | typing.Sequence[float], other_axis: Vector | typing.Sequence[float],
+                          axis_name: str) -> Matrix:
+    if axis_name not in 'xz':
+        raise ValueError(f"axis_name must be 'x' or 'z', got {axis_name!r}")
 
-    y_axis = Vector(y_axis).normalized()
+    # Vector.cross is typed as float | Vector in the stubs (it returns a scalar for 2D vectors),
+    # so the 3D vector results are cast back to Vector. The stub also rejects a Vector as the
+    # Vector() constructor argument, hence the cast on the inputs.
+    y_vec = Vector(typing.cast(typing.Sequence[float], y_axis)).normalized()
+    other_vec = Vector(typing.cast(typing.Sequence[float], other_axis))
 
     if axis_name == 'x':
-        z_axis = Vector(other_axis).cross(y_axis).normalized()
-        x_axis = y_axis.cross(z_axis)
+        z_axis = typing.cast(Vector, other_vec.cross(y_vec)).normalized()
+        x_axis = typing.cast(Vector, y_vec.cross(z_axis))
     else:
-        x_axis = y_axis.cross(other_axis).normalized()
-        z_axis = x_axis.cross(y_axis)
+        x_axis = typing.cast(Vector, y_vec.cross(other_vec)).normalized()
+        z_axis = typing.cast(Vector, x_axis.cross(y_vec))
 
-    return Matrix((x_axis, y_axis, z_axis)).transposed()
+    return Matrix(typing.cast(typing.Sequence[typing.Sequence[float]], (x_axis, y_vec, z_axis))).transposed()

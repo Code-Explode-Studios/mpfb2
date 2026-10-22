@@ -1,3 +1,5 @@
+"""This is the root directory of the UI layer."""
+
 from ..services import LogService
 from ..services import SystemService
 
@@ -8,72 +10,50 @@ UI_DUMMY_VALUE = None  # To be able to import something independent of blender v
 
 if SystemService.is_blender_version_at_least():
 
-    # Top level panels
-    from .newpanel import *
-    from .presetspanel import *
+    # Meta classes. These are used by most panels and operators.
+    from .abstractpanel import Abstract_Panel
+    from .mpfboperator import MpfbOperator
+    from .mpfbcontext import MpfbContext, ContextFocusObject, ContextResolveEffort
+    from .pollstrategy import pollstrategy, PollStrategy
+
+    # Special cases in the UI layer. These contain specific complex logic which makes them
+    # unsuitable to arrange in the same manner as the rest of the UI layer.
     from .model import *
-    from .rigpanel import *
-    from .assetspanel import *
-    from .operationspanel import *
-    from .createpanel import *
-    from .systempanel import *
     from .developer import *
 
-    # New human panels
-    from .newhuman import *
-    from .importer import *
-    from .importerpresets import *
-
-    # Create assets panels
-    from .makeskin import *
-    from .maketarget import *
-    from .makeclothes import *
-    from .makeweight import *
-    from .makepose import *
-    from .makerig import *
-    from .makeup import *
-
-    # Rig panels
-    from .addrig import *
-    from .rigify import *
-    from .righelpers import *
-    from .applypose import *
-    from .addcycle import *
-
-    # Presets
-    from .humanpresets import *
-    from .enhancedsettings import *
-    from .eyesettings import *
-    from .makeuppresets import *
-
-    # Assets
-    from .assetlibrary import *
-    from .loadclothes import *
-
-    # Operations
-    from .animops import *
-    from .basemeshops import *
-    from .poseops import *
-    from .sculpt import *
-    from .matops import *
-    from .boneops import *
-    from .ai import *
-
-    # System
-    from .webresources import *
-    from .dirresources import *
+    # Most of the UI layer follows a common pattern: A top level directory matching a main panel
+    # in the ui, with subdirectories matching subpanels. Note that the order in which the sections
+    # are imported does not decide the order the panels are drawn in. That is decided by the
+    # bl_order of each top level panel.
+    from .start_here import *
+    from .new_human import *
+    from .create_assets import *
+    from .rigging import *
+    from .presets import *
+    from .apply_assets import *
+    from .haireditorpanel import *
+    from .operations import *
+    from .system import *
 
     __all__ = [
+        "Abstract_Panel",
+        "MpfbOperator",
+        "MpfbContext",
+        "ContextFocusObject",
+        "ContextResolveEffort",
+        "pollstrategy",
+        "PollStrategy",
+        "MPFB_PT_Start_Here_Panel",
         "MPFB_PT_New_Panel",
+        "MPFB_PT_Randomize_Panel",
         "MPFB_PT_Create_Panel",
-        "MPFB_PT_Add_Rig_Panel",
+        "MPFB_PT_Standard_Rig_Panel",
+        "MPFB_PT_Rigify_Rig_Panel",
+        "MPFB_PT_Custom_Rig_Panel",
         "MPFB_PT_Importer_Panel",
         "MPFB_PT_Importer_Presets_Panel",
         "MPFB_PT_Presets_Panel",
-        # "MPFB_PT_Targets_Panel",
-        # "MPFB_PT_Clothes_Panel",
         "MPFB_PT_Save_Nodes_Panel",
-        "MPFB_PT_RigHelpersPanel",
         "MPFB_PT_Enhanced_Settings_Panel",
         "MPFB_PT_Eye_Settings_Panel",
         "MPFB_PT_MakeSkin_Panel",
@@ -81,7 +61,8 @@ if SystemService.is_blender_version_at_least():
         "MPFB_PT_Load_Clothes_Panel",
         "MPFB_PT_MakeClothes_Panel",
         "MPFB_PT_Operations_Panel",
-        "MPFB_PT_Devloper_Panel",
+        "MPFB_PT_Developer_Panel",
+        "MPFB_PT_Hair_Editor_Panel",
         "MPFB_PT_Ai_Panel",
         "UI_DUMMY_VALUE"
         ]

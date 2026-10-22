@@ -146,3 +146,11 @@ cython_debug/
 .coverage
 reports
 
+# Backup files
+*.bak
+*~
+
+# Transient notes 
+feature-requests/
+non-coding-efforts/
+

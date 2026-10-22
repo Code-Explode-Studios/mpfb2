@@ -1,16 +1,33 @@
 """This module contains utility functions scanning asset repositories."""
 
-import os, bpy, json
+import os, bpy, json, zipfile, shutil, tempfile, typing
 from pathlib import Path
+from typing import Any
+from bpy.utils.previews import ImagePreviewCollection
 from .logservice import LogService
 from .locationservice import LocationService
 from .systemservice import SystemService
 
 _LOG = LogService.get_logger("services.assetservice")
 
-_ASSETS = dict()
-_ASSET_THUMBS = None
-_PACKS = None
+# Asset subdir -> asset label -> the item dict described by update_asset_list().
+_ASSETS: dict[str, dict[str, dict[str, Any]]] = dict()
+
+# The one preview collection all asset thumbnails are loaded into. None until the first load.
+_ASSET_THUMBS: ImagePreviewCollection | None = None
+
+# (asset source, asset subdir) -> absolute paths of the asset's alternative material files.
+_ALTERNATIVE_MATERIALS: dict[tuple[str, str], list[str]] = dict()
+
+# (asset source, asset subdir) -> the UI tile dicts built by alternative_material_tiles_for_asset().
+_ALTERNATIVE_MATERIAL_TILES: dict[tuple[str, str], list[dict[str, Any]]] = dict()
+
+# Pack name -> the pack's JSON contents, which map asset name to that asset's metadata. None means
+# "not yet scanned", which is what _ensure_pack_metadata() tests; an empty dict means "scanned, no packs".
+_PACKS: dict[str, dict[str, Any]] | None = None
+
+# The list built by get_custom_rigs(). None means "not yet scanned".
+_CUSTOM_RIGS_CACHE: list[dict[str, Any]] | None = None
 
 ASSET_LIBRARY_SECTIONS = [
         {
@@ -128,18 +145,19 @@ class AssetService:
     collection from Blender's bpy.utils.previews.
 
     _PACKS: This variable is used to store metadata about asset packs. It is initialized as None and is populated when pack metadata
-    is scanned and loaded.
+    is scanned and loaded. None means "not scanned yet", while an empty dict means "scanned, but no packs were found". It is reset
+    to None by invalidate_pack_metadata_cache(), which is called from update_all_asset_lists().
 
     ASSET_LIBRARY_SECTIONS: This is a list of dictionaries, each representing a section of the asset library. Each dictionary contains
     metadata about a specific type of asset, including labels, subdirectory names, asset types, and override flags. This list is used
     to define and manage different categories of assets within the project.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         raise RuntimeError("You should not instance AssetService. Use its static methods instead.")
 
     @staticmethod
-    def find_asset_files_matching_pattern(asset_roots, pattern="*.mhclo"):
+    def find_asset_files_matching_pattern(asset_roots: list[str], pattern: str = "*.mhclo") -> list[Path]:
         """
         Scan the given asset roots for files matching the specified pattern.
 
@@ -174,7 +192,7 @@ class AssetService:
         return found_files
 
     @staticmethod
-    def find_asset_absolute_path(asset_path_fragment, asset_subdir="clothes"):
+    def find_asset_absolute_path(asset_path_fragment: str, asset_subdir: str = "clothes") -> str | None:
         """
         Find the absolute path of an asset given a path fragment and an asset subdirectory.
 
@@ -223,71 +241,86 @@ class AssetService:
         return os.path.abspath(matches[0])
 
     @staticmethod
-    def list_mhclo_assets(asset_subdir="clothes"):
+    def list_mhclo_assets(asset_subdir: str = "clothes") -> list[Path]:
         """Convenience wrapper for finding all mhclo assets for a subdir."""
         _LOG.enter()
         roots = AssetService.get_asset_roots(asset_subdir)
         return AssetService.find_asset_files_matching_pattern(roots, "*.mhclo")
 
     @staticmethod
-    def list_mhmat_assets(asset_subdir="skins"):
+    def list_mhmat_assets(asset_subdir: str = "skins") -> list[Path]:
         """Convenience wrapper for finding all mhmat assets for a subdir."""
         _LOG.enter()
         roots = AssetService.get_asset_roots(asset_subdir)
         return AssetService.find_asset_files_matching_pattern(roots, "*.mhmat")
 
     @staticmethod
-    def list_bvh_assets(asset_subdir="poses"):
+    def list_bvh_assets(asset_subdir: str = "poses") -> list[Path]:
         """Convenience wrapper for finding all bvh assets for a subdir."""
         _LOG.enter()
         roots = AssetService.get_asset_roots(asset_subdir)
         return AssetService.find_asset_files_matching_pattern(roots, "*.bvh")
 
     @staticmethod
-    def list_ink_layer_assets(asset_subdir="ink_layers"):
+    def list_ink_layer_assets(asset_subdir: str = "ink_layers") -> list[Path]:
         """Convenience wrapper for finding all ink layers."""
         _LOG.enter()
         roots = AssetService.get_asset_roots(asset_subdir)
         return AssetService.find_asset_files_matching_pattern(roots, "*.json")
 
     @staticmethod
-    def list_proxy_assets(asset_subdir="proxymeshes"):
+    def list_proxy_assets(asset_subdir: str = "proxymeshes") -> list[Path]:
         """Convenience wrapper for finding all proxy assets for a subdir."""
         _LOG.enter()
         roots = AssetService.get_asset_roots(asset_subdir)
         return AssetService.find_asset_files_matching_pattern(roots, "*.proxy")
 
     @staticmethod
-    def alternative_materials_for_asset(asset_source, asset_subdir="clothes", exclude_default=True):
+    def alternative_materials_for_asset(
+        asset_source: str | None,
+        asset_subdir: str = "clothes",
+        exclude_default: bool = True,
+    ) -> list[str]:
         """
         Find alternative materials for a given asset.
 
         Args:
-            asset_source (str): The source path fragment of the asset.
+            asset_source (str | None): The source path fragment of the asset.
             asset_subdir (str): The subdirectory under which to search for the asset (default is "clothes").
             exclude_default (bool): Whether to exclude the default material (default is True).
 
         Returns:
-            list: A list of paths to alternative material files for the asset.
+            list: A sorted list of paths to alternative material files for the asset.
         """
         _LOG.enter()
         _LOG.debug("starting scan for alternative materials for asset source", asset_source)
         if not asset_source:
             return []
+        cache_key = (str(asset_source), str(asset_subdir))
+        if cache_key in _ALTERNATIVE_MATERIALS:
+            _LOG.debug("Returning cached alternative materials for", cache_key)
+            return list(_ALTERNATIVE_MATERIALS[cache_key])
         mhclo_path = AssetService.find_asset_absolute_path(asset_source, asset_subdir)
         _LOG.debug("alternative_materials_for_asset, mhclo path", mhclo_path)
+        if not mhclo_path:
+            _LOG.warn("Could not find asset, so no alternative materials either", asset_source)
+            _ALTERNATIVE_MATERIALS[cache_key] = []
+            return []
         roots = AssetService.get_asset_roots(asset_subdir)
         parent_dir = os.path.basename(os.path.dirname(os.path.realpath(mhclo_path)))
         _LOG.debug("Parent dir to match against", parent_dir)
-        possible_materials = []
+        possible_materials = set()
         for mat in AssetService.find_asset_files_matching_pattern(roots, "*.mhmat"):
-            if SystemService.string_contains_path_segment(mat, parent_dir):
-                possible_materials.append(str(mat))
-        # If asset_subdir is "eyes", then also search alternative location for materials
-        if asset_subdir == "eyes":
-            for mat in AssetService.find_asset_files_matching_pattern(roots, "*.mhmat"):
-                if SystemService.string_contains_path_segment(mat, "materials"):
-                    possible_materials.append(str(mat))
+            # find_asset_files_matching_pattern() yields Path objects, and string_contains_path_segment()
+            # wants a str. It stringifies internally anyway, so this is the same call it already made; the
+            # conversion is spelled out here to match the str(mat) on the following line.
+            mat_path = str(mat)
+            if SystemService.string_contains_path_segment(mat_path, parent_dir):
+                possible_materials.add(mat_path)
+            # If asset_subdir is "eyes", then also match the alternative location for materials
+            elif asset_subdir == "eyes" and SystemService.string_contains_path_segment(mat_path, "materials"):
+                possible_materials.add(mat_path)
+        possible_materials = sorted(possible_materials)
         _LOG.debug("alternative_materials_for_asset, possible materials", possible_materials)
         if len(possible_materials) < 2 and _LOG.debug_enabled():
             _LOG.warn("Debugging alternative materials")
@@ -295,10 +328,99 @@ class AssetService:
             _LOG.debug("Dirname", dir_name)
             for file in os.listdir(dir_name):
                 _LOG.debug("File/dir in same folder", file)
-        return possible_materials
+        _ALTERNATIVE_MATERIALS[cache_key] = possible_materials
+        return list(possible_materials)
 
     @staticmethod
-    def get_available_data_roots():
+    def get_placeholder_thumbnail() -> Any:
+        """
+        Get the preview to use for assets which do not have a thumbnail of their own.
+
+        Returns:
+            Any: The bpy.types.ImagePreview for the bundled placeholder image, or None if it could not be
+            loaded. Annotated Any rather than ImagePreview | None because the value goes straight into a
+            UILayout's icon_value, and the preview collection is a dict subclass whose element type the
+            stubs only describe loosely.
+        """
+        global _ASSET_THUMBS
+
+        if _ASSET_THUMBS is None:
+            _ASSET_THUMBS = bpy.utils.previews.new()
+
+        thumb = LocationService.get_mpfb_data("textures/notfound.thumb")
+        if not os.path.exists(thumb):
+            _LOG.warn("The bundled placeholder thumbnail is missing", thumb)
+            return None
+        if not thumb in _ASSET_THUMBS:
+            _ASSET_THUMBS.load(thumb, thumb, 'IMAGE')
+        return _ASSET_THUMBS[thumb]
+
+    @staticmethod
+    def alternative_material_tiles_for_asset(
+        asset_source: str | None,
+        asset_subdir: str = "clothes",
+    ) -> list[dict[str, Any]]:
+        """
+        Find alternative materials for an asset, with thumbnails and labels suitable for a UI grid.
+
+        The returned items have the same shape as those in the asset list, see update_asset_list().
+        Materials which do not have a thumbnail of their own get the bundled placeholder, so that
+        all tiles can be drawn at the same size.
+
+        Args:
+            asset_source (str | None): The source path fragment of the asset.
+            asset_subdir (str): The subdirectory under which to search for the asset (default is "clothes").
+
+        Returns:
+            list: A list of items describing the alternative materials for the asset.
+        """
+        global _ASSET_THUMBS
+
+        _LOG.enter()
+
+        if not asset_source:
+            return []
+
+        cache_key = (str(asset_source), str(asset_subdir))
+        if cache_key in _ALTERNATIVE_MATERIAL_TILES:
+            _LOG.debug("Returning cached alternative material tiles for", cache_key)
+            return _ALTERNATIVE_MATERIAL_TILES[cache_key]
+
+        if _ASSET_THUMBS is None:
+            _ASSET_THUMBS = bpy.utils.previews.new()
+
+        tiles = []
+        for material in AssetService.alternative_materials_for_asset(asset_source, asset_subdir):
+            item = dict()
+            item["full_path"] = str(material)
+            item["basename"] = os.path.basename(material)
+            item["dirname"] = os.path.dirname(material)
+            item["fragment"] = AssetService.path_to_fragment(material, asset_subdir=asset_subdir)
+            item["name_without_ext"] = str(item["basename"]).replace(".mhmat", "")
+            item["thumb"] = None
+            item["thumb_path"] = None
+            label = str(item["name_without_ext"]).lower().replace("_", " ")
+            item["label"] = label.capitalize()
+
+            thumb = os.path.join(item["dirname"], item["name_without_ext"] + ".thumb")
+            if os.path.exists(thumb):
+                item["thumb_path"] = thumb
+                _LOG.debug("Will try to load icon", (item["label"], thumb))
+                if not thumb in _ASSET_THUMBS:
+                    _ASSET_THUMBS.load(thumb, thumb, 'IMAGE')
+                item["thumb"] = _ASSET_THUMBS[thumb]
+            else:
+                _LOG.debug("Missing thumb, using placeholder", thumb)
+                item["thumb"] = AssetService.get_placeholder_thumbnail()
+
+            _LOG.dump("Item", item)
+            tiles.append(item)
+
+        _ALTERNATIVE_MATERIAL_TILES[cache_key] = tiles
+        return tiles
+
+    @staticmethod
+    def get_available_data_roots() -> list[str]:
         """
         Retrieve the available data roots from various locations.
 
@@ -330,7 +452,7 @@ class AssetService:
         return roots
 
     @staticmethod
-    def get_asset_roots(asset_subdir="clothes"):
+    def get_asset_roots(asset_subdir: str = "clothes") -> list[str]:
         """
         Retrieve the available data roots from various locations.
 
@@ -353,7 +475,7 @@ class AssetService:
         return asset_roots
 
     @staticmethod
-    def update_asset_list(asset_subdir="clothes", asset_type="mhclo"):
+    def update_asset_list(asset_subdir: str = "clothes", asset_type: str = "mhclo") -> None:
         """
         Update the list of assets for a given subdirectory and asset type.
 
@@ -399,7 +521,7 @@ class AssetService:
                     _ASSET_THUMBS.load(thumb, thumb, 'IMAGE')
                 item["thumb"] = _ASSET_THUMBS[thumb]
             else:
-                _LOG.warn("Missing thumb", thumb)
+                _LOG.debug("Missing thumb", thumb)
 
             _LOG.dump("Item", item)
             asset_list[label] = item
@@ -407,15 +529,24 @@ class AssetService:
         _ASSETS[asset_subdir] = asset_list
 
     @staticmethod
-    def update_all_asset_lists():
+    def invalidate_alternative_materials_cache() -> None:
+        """Empty the cache of alternative materials, so that it is rescanned on next request."""
+        _LOG.enter()
+        _ALTERNATIVE_MATERIALS.clear()
+        _ALTERNATIVE_MATERIAL_TILES.clear()
+
+    @staticmethod
+    def update_all_asset_lists() -> None:
         """Update the global asset list cache"""
         for section in ASSET_LIBRARY_SECTIONS:
             asset_subdir = section["asset_subdir"]
             asset_type = section["asset_type"]
             AssetService.update_asset_list(asset_subdir, asset_type)
+        AssetService.invalidate_alternative_materials_cache()
+        AssetService.invalidate_pack_metadata_cache()
 
     @staticmethod
-    def get_asset_list(asset_subdir="clothes", asset_type="mhclo"):
+    def get_asset_list(asset_subdir: str = "clothes", asset_type: str = "mhclo") -> dict[str, dict[str, Any]]:
         """
         Retrieve the list of assets for a given subdirectory and asset type.
 
@@ -434,7 +565,11 @@ class AssetService:
         return _ASSETS[asset_subdir]
 
     @staticmethod
-    def path_to_fragment(asset_full_path, relative_to_fragment=None, asset_subdir="clothes"):
+    def path_to_fragment(
+        asset_full_path: str,
+        relative_to_fragment: str | None = None,
+        asset_subdir: str = "clothes",
+    ) -> str:
         """Convert an absolute path of an assset to a fragment path."""
         if not relative_to_fragment:
             return os.path.basename(os.path.dirname(asset_full_path)) + "/" + os.path.basename(asset_full_path)
@@ -442,7 +577,7 @@ class AssetService:
         raise NotImplementedError('Manually specified relative_to_fragment has not been implemented yet.')
 
     @staticmethod
-    def have_any_pack_meta_data():
+    def have_any_pack_meta_data() -> bool:
         """Check if any asset pack at all as been installed."""
         packs_dir = LocationService.get_user_data("packs")
         _LOG.debug("Packs dir, exists", (packs_dir, os.path.exists(packs_dir)))
@@ -457,11 +592,47 @@ class AssetService:
         return False
 
     @staticmethod
-    def rescan_pack_metadata():
+    def check_if_modern_makehuman_system_assets_installed() -> tuple[bool, bool]:
+        """Check if the makehuman system assets pack is installed in the user data directory. Also
+        check whether the brown.mhmat file is installed. If the latter isn't available, then this is an
+        indication that the user has a very old version of the makehuman system assets pack installed.
+
+        Returns:
+            tuple(bool,bool): First is true if the system assets pack is installed, False otherwise. Second is True if the brown.mhmat file is installed, False otherwise.
+        """
+
+        pack_path = os.path.join(LocationService.get_user_data("packs"), "makehuman_system_assets.json")
+        system_assets_pack_installed = os.path.exists(pack_path)
+        _LOG.debug("System assets pack installed?", (pack_path, system_assets_pack_installed))
+
+        eyes_path = os.path.join(LocationService.get_user_data("eyes"), "materials", "brown.mhmat")
+        brown_mhmat_installed = os.path.exists(eyes_path)
+        _LOG.debug("Brown.mhmat installed?", (eyes_path, brown_mhmat_installed))
+
+        return system_assets_pack_installed, brown_mhmat_installed
+
+    @staticmethod
+    def invalidate_pack_metadata_cache() -> None:
+        """Empty the cache of pack metadata, so that it is rescanned on next request."""
+        _LOG.enter()
+        global _PACKS
+        _PACKS = None
+
+    @staticmethod
+    def _ensure_pack_metadata() -> None:
+        """Load the pack metadata if it has not been scanned yet. Note that a scan which found no
+        packs at all still counts as having been scanned, so this will not hit the file system
+        again until the cache has been explicitly invalidated."""
+        if _PACKS is None:
+            AssetService.rescan_pack_metadata()
+
+    @staticmethod
+    def rescan_pack_metadata() -> None:
         """
         Load pack metadata from JSON files in the packs directory.
 
-        If pack metadata is already loaded, this method does nothing.
+        The metadata is always reread from disk, also if it has been loaded before. Use
+        _ensure_pack_metadata() if you only want to read it when it isn't cached yet.
         """
         global _PACKS
         _PACKS = dict()
@@ -480,39 +651,38 @@ class AssetService:
                     _PACKS[packname] = json.load(json_file)
 
     @staticmethod
-    def get_pack_names():
+    def get_pack_names() -> list[str]:
         """
         Retrieve the names of all available asset packs.
 
         This method rescans the pack metadata if it has not been loaded yet. If no pack metadata is found,
-        it returns an empty list.
+        it returns an empty list. Once the metadata has been read it is cached, so this is cheap enough
+        to call from a panel's draw method. The cache is invalidated by update_all_asset_lists().
 
         Returns:
             list: A sorted list of asset pack names.
         """
-        global _PACKS  # pylint: disable=W0602
-        if not _PACKS:
-            AssetService.rescan_pack_metadata()
-        if not AssetService.have_any_pack_meta_data():
-            return []
-        names = list(_PACKS.keys())
+        AssetService._ensure_pack_metadata()
+        # _ensure_pack_metadata() has just replaced a None _PACKS with a dict, but the checker cannot
+        # see that through the call, so the guarantee has to be restated as a cast.
+        names = list(typing.cast(dict[str, dict[str, Any]], _PACKS).keys())
         names.sort()
         return names
 
     @staticmethod
-    def system_assets_pack_is_installed():
+    def system_assets_pack_is_installed() -> bool:
         """
         Scan the list of pack names to determine if there is a pack makehuman_system_assets seems to be installed.
         """
         return "makehuman_system_assets" in AssetService.get_pack_names()
 
     @staticmethod
-    def get_asset_names_in_pack(pack_name):
+    def get_asset_names_in_pack(pack_name: str) -> list[str]:
         """
         Retrieve the names of all assets in a specified pack.
 
         This method rescans the pack metadata if it has not been loaded yet. If no pack metadata is found,
-        it returns an empty list.
+        or if there is no pack with the given name, it returns an empty list.
 
         Args:
             pack_name (str): The name of the pack to retrieve asset names from.
@@ -520,18 +690,15 @@ class AssetService:
         Returns:
             list: A sorted list of asset names in the specified pack.
         """
-        global _PACKS  # pylint: disable=W0602
-        if not _PACKS:
-            AssetService.rescan_pack_metadata()
-        if not AssetService.have_any_pack_meta_data():
-            return []
-        pack_data = _PACKS[pack_name]
+        AssetService._ensure_pack_metadata()
+        # As in get_pack_names(): _ensure_pack_metadata() guarantees a dict, the checker cannot see it.
+        pack_data = typing.cast(dict[str, dict[str, Any]], _PACKS).get(pack_name, dict())
         names = list(pack_data.keys())
         names.sort()
         return names
 
     @staticmethod
-    def get_asset_names_in_pack_pattern(pack_pattern):
+    def get_asset_names_in_pack_pattern(pack_pattern: str) -> list[str]:
         """
         Retrieve the names of all assets in packs that match a given pattern.
 
@@ -551,3 +718,173 @@ class AssetService:
                 asset_names.extend(AssetService.get_asset_names_in_pack(name))
         asset_names.sort()
         return asset_names
+
+    @staticmethod
+    def get_custom_rigs(use_cache: bool = True) -> list[dict[str, Any]]:
+        """Scan user asset roots for custom rig JSON files.
+
+        Returns a list of dicts: {name, path, identifying_bones}.
+        Only scans user data roots (not the system MPFB data root).
+
+        Args:
+            use_cache (bool): If True, return cached results when available.
+
+        Returns:
+            list: List of dicts with keys 'name', 'path', 'identifying_bones'.
+        """
+        import re as _re
+        global _CUSTOM_RIGS_CACHE  # pylint: disable=W0603
+        if use_cache and _CUSTOM_RIGS_CACHE is not None:
+            return _CUSTOM_RIGS_CACHE
+
+        found = []
+        roots = []
+
+        user_data = LocationService.get_user_data()
+        if user_data and os.path.exists(user_data):
+            roots.append(user_data)
+
+        second_root = LocationService.get_second_root()
+        if second_root and os.path.exists(second_root) and second_root not in roots:
+            roots.append(second_root)
+
+        for root in roots:
+            rigs_dir = os.path.join(root, "rigs")
+            if not os.path.isdir(rigs_dir):
+                continue
+            for filename in os.listdir(rigs_dir):
+                if not filename.endswith(".json"):
+                    continue
+                name = filename[:-5]  # strip .json
+                if not _re.match(r'^[a-zA-Z0-9_]+$', name):
+                    _LOG.debug("Skipping custom rig file with invalid name", filename)
+                    continue
+                filepath = os.path.join(rigs_dir, filename)
+                try:
+                    with open(filepath, "r") as f:
+                        data = json.load(f)
+                except Exception:  # pylint: disable=W0703
+                    _LOG.warn("Could not parse custom rig file", filepath)
+                    continue
+                if "identifying_bones" not in data:
+                    continue
+                found.append({
+                    "name": name,
+                    "path": filepath,
+                    "identifying_bones": data["identifying_bones"]
+                })
+
+        _CUSTOM_RIGS_CACHE = found
+        return found
+
+    @staticmethod
+    def invalidate_custom_rig_cache() -> None:
+        """Clear the cached custom rig list so the next call to get_custom_rigs() rescans disk."""
+        global _CUSTOM_RIGS_CACHE  # pylint: disable=W0603
+        _CUSTOM_RIGS_CACHE = None
+
+    @staticmethod
+    def get_custom_rigs_enum_items() -> list[tuple[str, str, str]]:
+        """Return custom rig names as Blender enum item tuples for use in EnumProperty callbacks.
+
+        Returns:
+            list: List of (identifier, label, description) tuples. Returns a single 'NONE' entry if no custom rigs exist.
+        """
+        custom_rigs = AssetService.get_custom_rigs()
+        if not custom_rigs:
+            return [("NONE", "No custom rigs found", "")]
+        return [(r["name"], "Custom: " + r["name"], "") for r in custom_rigs]
+
+    @staticmethod
+    def check_asset_pack_zip(filename: str) -> str | None:
+        """Check if a file is a valid zip file containing a makehuman asset pack.
+
+        Args:
+            filename (str): The file to check.
+
+        Returns:
+            str | None: None if everything is fine, otherwise a string describing the error.
+            Possible error strings: "MACOS", "STRUCTURE", "NO_PACKS", "INVALID_ZIP: <reason>"
+        """
+        try:
+            with zipfile.ZipFile(filename, "r") as zf:
+                namelist = zf.namelist()
+
+            for name in namelist:
+                _LOG.debug("Zip entry:", name)
+                if name.startswith("packs/"):
+                    # A valid zip has packs/ at root level
+                    return None
+
+            has_macos = any(name.startswith("__MACOSX") for name in namelist)
+
+            # Collect distinct root-level directory names, ignoring __MACOSX and dotfiles
+            root_dirs = set()
+            for name in namelist:
+                parts = name.split("/")
+                if parts[0] and not parts[0].startswith(".") and parts[0] != "__MACOSX":
+                    root_dirs.add(parts[0])
+
+            # If there is exactly one root directory and it contains packs/, this is fixable
+            if len(root_dirs) == 1:
+                root = next(iter(root_dirs))
+                if any(n.startswith(f"{root}/packs/") for n in namelist):
+                    if has_macos:
+                        return "MACOS"
+                    return "STRUCTURE"
+
+            return "NO_PACKS"
+        except (zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+            return f"INVALID_ZIP: {str(e)}"
+
+    @staticmethod
+    def fix_and_extract_asset_pack_zip(filename: str, target_dir: str) -> str | None:
+        """Extract an asset pack zip to target_dir, stripping one extra root directory if needed.
+
+        Handles the common re-packaging error where the zip has a single extra root directory
+        (e.g., from Safari auto-unpacking and the user re-zipping the resulting folder).
+        __MACOSX metadata directories are always stripped during extraction.
+
+        Args:
+            filename (str): Path to the zip file.
+            target_dir (str): Destination directory (user data dir).
+
+        Returns:
+            str | None: None on success, or a string describing the error. Possible error strings:
+            "FIX_FAILED", "FIX_ERROR: <reason>".
+        """
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(filename, "r") as zf:
+                for member in zf.infolist():
+                    if member.filename.startswith("__MACOSX"):
+                        continue
+                    zf.extract(member, tmp_dir)
+
+            root_entries = [e for e in os.listdir(tmp_dir) if not e.startswith(".")]
+
+            if "packs" in root_entries:
+                source_root = tmp_dir
+            else:
+                root_dirs = [e for e in root_entries if os.path.isdir(os.path.join(tmp_dir, e))]
+                if len(root_dirs) != 1:
+                    return "FIX_FAILED"
+                candidate = os.path.join(tmp_dir, root_dirs[0])
+                if "packs" not in os.listdir(candidate):
+                    return "FIX_FAILED"
+                source_root = candidate
+
+            for entry in os.listdir(source_root):
+                if entry.startswith("."):
+                    continue
+                src = os.path.join(source_root, entry)
+                dst = os.path.join(target_dir, entry)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst)
+            return None
+        except Exception as e:  # pylint: disable=broad-except
+            return f"FIX_ERROR: {str(e)}"
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)

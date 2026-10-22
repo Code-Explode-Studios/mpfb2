@@ -21,6 +21,27 @@ _LOG.debug("Target dir:", _TARGETS_DIR)
 _TARGETS_JSON = os.path.join(_TARGETS_DIR, "target.json")
 _LOG.debug("Targets json:", _TARGETS_JSON)
 
+_SIDE_PREFIXES = {"unsided": ".", "left": ".l-", "right": ".r-"}
+
+
+def _category_identifier(section_name, category_name, side="unsided"):
+    """Derive the blender scene property identifier for one side of one category.
+
+    This is the single source of truth for the identifier format. It is used both when registering the
+    properties at import time and when drawing them in the sub panels, so that the two always agree."""
+    return UiService.as_valid_identifier(str(section_name) + _SIDE_PREFIXES[side] + str(category_name))
+
+
+def _category_identifiers(section_name, category):
+    """List the identifiers which will actually be registered for a category.
+
+    A category with left and right sides gets an "l-" and an "r-" property and no unsided one, while a
+    category without sides only gets the unsided property."""
+    if category.get("has_left_and_right"):
+        return [_category_identifier(section_name, category["name"], "left"),
+                _category_identifier(section_name, category["name"], "right")]
+    return [_category_identifier(section_name, category["name"])]
+
 
 class _Abstract_Model_Panel(Abstract_Panel):
     """Human modeling panel"""
@@ -63,10 +84,10 @@ class _Abstract_Model_Panel(Abstract_Panel):
             box.alert = is_modified
 
             if category["has_left_and_right"]:
-                box.prop(scene, UiService.as_valid_identifier(self.section_name + ".l-" + category["name"]), text="Left:")
-                box.prop(scene, UiService.as_valid_identifier(self.section_name + ".r-" + category["name"]), text="Right:")
+                box.prop(scene, _category_identifier(self.section_name, category["name"], "left"), text="Left:")
+                box.prop(scene, _category_identifier(self.section_name, category["name"], "right"), text="Right:")
             else:
-                box.prop(scene, UiService.as_valid_identifier(self.section_name + "." + category["name"]), text="Value:")
+                box.prop(scene, _category_identifier(self.section_name, category["name"]), text="Value:")
 
     def draw(self, context):
         _LOG.enter()
@@ -95,7 +116,6 @@ class _Abstract_Model_Panel(Abstract_Panel):
     @classmethod
     def poll(cls, context):
         return cls.active_object_is_basemesh(context, also_check_relatives=True, also_check_for_shapekeys=True)
-
 
 _sections = dict()
 with open(_TARGETS_JSON, "r") as _json_file:
@@ -158,6 +178,50 @@ if os.path.exists(user_targets_dir):
 else:
     _LOG.debug("User targets dir does not exist", user_targets_dir)
 
+
+def _drop_categories_with_unusable_identifiers(sections):
+    """Remove categories whose scene property identifier would be rejected by blender.
+
+    Blender raises when an identifier is 64 characters or longer, and since this module does all of its
+    work while being imported, such a target would abort the entire addon registration. A custom or user
+    target is named after its file, so a long enough file name will trip this.
+
+    The categories are removed from the given sections in place. This has to happen before
+    _SORTED_CATEGORIES and _CATEGORIES_BY_LABEL are constructed, so that the panels never try to draw a
+    property which was never registered, and before the getter and setter factories are called, since
+    the category_index they close over is a position in this very list.
+
+    Args:
+        sections (dict): The sections dict, keyed by section name.
+
+    Returns:
+        list: One (section_name, category, offending_identifier) tuple per dropped category.
+    """
+    dropped = []
+    for section_name in sections.keys():
+        surviving = []
+        for category in sections[section_name].get("categories", []):
+            too_long = None
+            for identifier in _category_identifiers(section_name, category):
+                if len(identifier) > UiService.MAX_IDENTIFIER_LENGTH:
+                    too_long = identifier
+                    break
+            if too_long is None:
+                surviving.append(category)
+            else:
+                dropped.append((section_name, category, too_long))
+        sections[section_name]["categories"] = surviving
+    return dropped
+
+
+for _dropped_section, _dropped_category, _dropped_identifier in _drop_categories_with_unusable_identifiers(_sections):
+    # The name is used as a blender property identifier, so an overly long file name makes the target
+    # unusable. Skip it rather than letting it abort the registration of the whole addon.
+    _LOG.warn("Skipping target since its name is too long to be used as a blender property identifier. The maximum is "
+              + str(UiService.MAX_IDENTIFIER_LENGTH) + " characters, including the \"" + str(_dropped_section)
+              + ".\" section prefix and any \"l-\" or \"r-\" side prefix. Rename this file to use it: "
+              + str(_dropped_category.get("full_path", _dropped_category["name"])), _dropped_identifier)
+
 _SORTED_CATEGORIES = {}
 _CATEGORIES_BY_LABEL = {}
 
@@ -168,7 +232,6 @@ for key in _sections.keys():
         _SORTED_CATEGORIES[str(key)].append(cat["label"])
         _CATEGORIES_BY_LABEL[str(key)][cat["label"]] = cat
     _SORTED_CATEGORIES[str(key)].sort()
-
 
 def _set_simple_modifier_value(scene, blender_object, section, category, value, side="unsided", load_target_if_needed=True):
     """This modifier is not a combination of opposing targets ("decr-incr", "in-out"...)"""
@@ -195,7 +258,6 @@ def _set_simple_modifier_value(scene, blender_object, section, category, value, 
         prune = MODEL_PROPERTIES.get_value("prune", entity_reference=bpy.context.scene)
         TargetService.set_target_value(blender_object, name, value, delete_target_on_zero=prune)
 
-
 def _get_simple_modifier_value(scene, blender_object, section, category, side="unsided"):
     """This modifier is not a combination of opposing targets ("decr-incr", "in-out"...)"""
     name = category["name"]
@@ -204,7 +266,6 @@ def _get_simple_modifier_value(scene, blender_object, section, category, side="u
     if side == "left":
         name = "l-" + name
     return TargetService.get_target_value(blender_object, name)
-
 
 def _get_opposed_modifier_value(scene, blender_object, section, category, side="unsided"):
     """This modifier is a combination of opposing targets ("decr-incr", "in-out"...)"""
@@ -218,7 +279,6 @@ def _get_opposed_modifier_value(scene, blender_object, section, category, side="
         return -TargetService.get_target_value(blender_object, negative)
 
     return 0.0
-
 
 def _set_opposed_modifier_value(scene, blender_object, section, category, value, side="unsided"):
     """This modifier is a combination of opposing targets ("decr-incr", "in-out"...)"""
@@ -261,7 +321,6 @@ def _set_opposed_modifier_value(scene, blender_object, section, category, value,
             else:
                 TargetService.set_target_value(blender_object, negative, abs(value), delete_target_on_zero=prune)
 
-
 def _set_modifier_value(scene, blender_object, section, category, value, side="unsided"):
     _LOG.dump("_set_modifier_value", (blender_object, category, value, side))
     ObjectService.activate_blender_object(blender_object)
@@ -273,13 +332,11 @@ def _set_modifier_value(scene, blender_object, section, category, value, side="u
     if MODEL_PROPERTIES.get_value("refit", entity_reference=bpy.context.scene):
         HumanService.refit(blender_object)
 
-
 def _get_modifier_value(scene, blender_object, section, category, side="unsided"):
     _LOG.dump("enter _get_modifier_value", (blender_object, category, side))
     if "opposites" in category:
         return _get_opposed_modifier_value(scene, blender_object, section, category, side)
     return _get_simple_modifier_value(scene, blender_object, section, category, side)
-
 
 _section_names = list(_sections.keys())
 _section_names.sort()
@@ -326,9 +383,9 @@ for name in _section_names:
     for _category in _section["categories"]:
         _LOG.debug("_category", _category)
 
-        _unsided_name = UiService.as_valid_identifier(name + "." + _category["name"])
-        _left_name = UiService.as_valid_identifier(name + ".l-" + _category["name"])
-        _right_name = UiService.as_valid_identifier(name + ".r-" + _category["name"])
+        _unsided_name = _category_identifier(name, _category["name"])
+        _left_name = _category_identifier(name, _category["name"], "left")
+        _right_name = _category_identifier(name, _category["name"], "right")
 
         _LOG.debug("names", (_unsided_name, _left_name, _right_name))
 
@@ -365,7 +422,6 @@ for name in _section_names:
 
     sub_panel = type("MPFB_PT_Model_Sub_Panel_" + name, (_Abstract_Model_Panel, Abstract_Panel), definition)
     _LOG.debug("sub_panel", (sub_panel, sub_panel.__bases__))
-
 
     ClassManager.add_class(sub_panel)
 
