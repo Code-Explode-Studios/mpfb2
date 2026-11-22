@@ -13,15 +13,20 @@ controllable starting point for close-up character art.
 ## Quick start
 
 1. Create an MPFB human with shape keys, in its ordinary upright neutral pose.
-2. Make sure the character has a node-based **Principled BSDF** body skin
-   material in material slot 0. This is the usual MPFB material layout.
+2. **No skin pack or material setup needed** for the basic foot effect. If this
+   is a brand-new MPFB human with no material, the tool generates a separate
+   node-based neutral skin preview automatically. Existing node-based skin is
+   duplicated and kept intact.
 3. Expand **Model → Foot shape & skin realism**.
 4. Click **Natural**, **Athletic**, or **Mature** to apply the example strengths.
    Alternatively set the six sliders and click **Apply custom foot detail**.
-5. Inspect each foot from its side, top and underside, using good lighting.
-   For major size changes use MPFB's existing **Model → Feet** controls.
-6. Click **Mute foot details** to zero the generated geometry shape keys and
-   restore the original material. MPFB's original foot morphs are not reset.
+5. The tool automatically enables **Material Preview** in the 3D View so
+   wrinkle bumps and pores are visible; Solid View **cannot** show them.
+   If needed click **Show skin wrinkles in Material Preview**. Zoom closely
+   to a foot and use bright side lighting for skin details.
+6. Inspect each foot from side, top and underside; for overall size use the
+   built-in **Model → Feet** controls. Click **Mute foot details** to zero the
+   generated shape keys and restore the previous material or empty slot.
 
 ## Controls
 
@@ -55,7 +60,9 @@ These presets do **not** change the character's sex or body phenotype.
   Ankle influence is gradually faded and existing phenotype/muscularity shape
   keys remain untouched.
 - Reapplying recomputes the four keys **from Basis**, preventing cumulative
-  geometry deformation. All adjustments remain shape keys, supporting Undo,
+  geometry deformation. **v2.0.20 raises full-strength arch displacement**
+  to an anatomy-inspired roughly 1–2 cm range on an ordinary adult human;
+  heel, metatarsal and toe relief also have more visible deformation. All adjustments remain shape keys, supporting Undo,
   animation and asset refitting through MPFB.
 
 ### Procedural skin implementation
@@ -63,17 +70,19 @@ These presets do **not** change the character's sex or body phenotype.
 - Two **POINT-domain FLOAT attributes**, `mpfb_foot_crease_mask` and
   `mpfb_foot_pore_mask`, are generated to isolate shader detail around the
   feet. No extra subdivision or geometry is added for pores.
-- The main body skin material is **copied per character** before modification,
-  including any relevant nested shader node groups, preventing edits to
-  globally shared skin materials.
+- On an untextured default human, the add-on creates a **neutral, node-based
+  skin preview** automatically. If a material already exists, the original
+  skin material is **copied per character** before modification, including
+  relevant nested shader node groups, preventing global shared-material edits.
 - A set of object-space **Wave** and **Noise** textures, each multiplied by
   the local attributes, feed two **Bump** nodes. The existing BSDF Normal map
   is preserved and chained into the new bump nodes. No photographic texture
   is downloaded or uploaded.
 - **Toes, nails and unrelated material slots** are left alone: the shader is
-  only injected into the primary body skin material in slot 0. A custom body
-  shader without any Principled BSDF is left unchanged and Blender reports a
-  warning; the geometry still applies.
+  injected into the primary body skin material in slot 0. A custom body shader
+  without a Principled BSDF is left untouched and reports a warning; geometry
+  still applies. On reset, a generated preview material is removed or the
+  original authored material is restored.
 
 ### Baking and exporting to Unity
 
