@@ -10,7 +10,6 @@ Copyright (C) 2026 MPFB contributors. GPL-3.0-or-later.
 import json
 import os
 import subprocess
-import sys
 
 import bpy
 import numpy as np
@@ -513,13 +512,13 @@ class MPFB_OT_Setup_Face_Detector(MpfbOperator):
             logpath = os.path.join(directory, "setup.log")
             _SETUP_LOG = open(logpath, "w", encoding="utf-8")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            # Blender is not a Python executable. The helper finds the bundled
-            # Python or a compatible system Python and creates an isolated venv.
+            # Blender itself is not a Python interpreter. Locate the bundled
+            # python binary (or a compatible system interpreter), then launch
+            # only that interpreter. The worker never touches bpy or Blender UI.
+            from .face_detector_setup import _choose_interpreter
+            interpreter = _choose_interpreter()
             _SETUP_PROCESS = subprocess.Popen(
-                [sys.executable, "--background", "--python-expr",
-                 "import runpy, sys; sys.argv = [%r, '--destination', %r]; "
-                 "runpy.run_path(%r, run_name='__main__')" %
-                 (setup_py, directory, setup_py)],
+                [interpreter, setup_py, "--destination", directory],
                 stdout=_SETUP_LOG, stderr=subprocess.STDOUT,
                 close_fds=True, creationflags=flags)
             _SETUP_DIR = directory
