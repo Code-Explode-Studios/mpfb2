@@ -11,7 +11,7 @@ import json
 import os
 
 import bpy
-from bpy.props import EnumProperty, FloatProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from ... import ClassManager
 from ...services import HumanService, LocationService, LogService, ObjectService, TargetService, UiService
@@ -27,12 +27,12 @@ _LOG = LogService.get_logger("model.footrealism")
 # The existing male/female macros are intentionally not changed. These are
 # illustrative artistic presets, not inferred sex-specific anatomy.
 FOOT_DETAIL_PRESETS = {
-    "natural": {"arch": 0.58, "heel": 0.54, "ball": 0.65, "toes": 0.40,
-                "wrinkles": 0.42, "pores": 0.55},
-    "athletic": {"arch": 0.84, "heel": 0.58, "ball": 0.78, "toes": 0.65,
-                 "wrinkles": 0.36, "pores": 0.62},
-    "mature": {"arch": 0.49, "heel": 0.78, "ball": 0.68, "toes": 0.65,
-               "wrinkles": 0.82, "pores": 0.73},
+    "natural": {"arch": 0.62, "heel": 0.67, "ball": 0.70, "toes": 0.58,
+                "wrinkles": 0.57, "pores": 0.65},
+    "athletic": {"arch": 0.96, "heel": 0.66, "ball": 0.84, "toes": 0.83,
+                 "wrinkles": 0.54, "pores": 0.72},
+    "mature": {"arch": 0.28, "heel": 0.94, "ball": 0.77, "toes": 0.74,
+               "wrinkles": 1.0, "pores": 0.85},
 }
 _PRESETS = (
     ("CUSTOM", "Current sliders", "Apply the current custom foot settings"),
@@ -224,31 +224,59 @@ def _set_bump_strengths(tree, wrinkles, pores, depth=0):
 
 
 def _ensure_skin_material(basemesh, scene):
-    """Copy main body skin and inject local-only masks.
+    """Provide working foot shading even on a fresh, untextured MPFB human.
 
-    MPFB reserves material slot 0 for the body's original skin. Other slots
-    (toenails, lips, eyes and so on) are left alone. If a skin node tree has
-    no Principled BSDF, skip rather than destroying a custom material.
+    A new human is deliberately untextured, so a missing skin material is
+    normal. Build an isolated, neutral skin preview in that case instead of
+    issuing the old "requires a Principled material" warning. Existing
+    material setups are never replaced without preserving their original.
     """
     mesh = basemesh.data
-    if not mesh.materials or not mesh.materials[0] or not mesh.materials[0].use_nodes:
-        return False
-    material = mesh.materials[0]
-    if not material.get(_MATERIAL_MARK):
-        candidate = material.copy()
-        candidate.name = material.name + " - Foot Detail"
+    had_slot = len(mesh.materials) > 0
+    original = mesh.materials[0] if had_slot else None
+
+    if original is not None and original.get(_MATERIAL_MARK):
+        material = original  # Reapply with new user-adjusted slider strengths.
+    else:
+        created = original is None
+        if original is not None and not original.use_nodes:
+            # Respect authored legacy custom skin materials. The user can
+            # create a node material manually rather than silently losing it.
+            return False
+        if created:
+            material = bpy.data.materials.new(basemesh.name + " - Foot Skin Preview")
+            material.use_nodes = True
+            material.diffuse_color = (0.58, 0.50, 0.45, 1.0)
+            principled = next((n for n in material.node_tree.nodes
+                               if n.type == 'BSDF_PRINCIPLED'), None)
+            if principled:
+                principled.inputs["Base Color"].default_value = (0.58, 0.50, 0.45, 1.0)
+                principled.inputs["Roughness"].default_value = 0.62
+        else:
+            material = original.copy()
+            material.name = original.name + " - Foot Detail"
+
         try:
-            added = _inject_foot_shader(candidate.node_tree)
-            if added == 0:
-                bpy.data.materials.remove(candidate)
+            if not material.node_tree or not _inject_foot_shader(material.node_tree):
+                bpy.data.materials.remove(material)
                 return False
-            candidate[_MATERIAL_MARK] = True
-            candidate[_ORIGINAL_MATERIAL] = material.name
-            mesh.materials[0] = candidate
-            material = candidate
+            material[_MATERIAL_MARK] = True
+            material[_ORIGINAL_MATERIAL] = original.name if original else ""
+            material["mpfb_foot_created_skin"] = created
+            material["mpfb_foot_had_slot"] = had_slot
+            if original is not None:
+                # Retain the old original after saving/reopening the blend.
+                material["mpfb_foot_original_fake_user"] = bool(original.use_fake_user)
+                original.use_fake_user = True
+            if had_slot:
+                mesh.materials[0] = material
+            else:
+                mesh.materials.append(material)
         except Exception:
-            bpy.data.materials.remove(candidate)
+            if material.users == 0:
+                bpy.data.materials.remove(material)
             raise
+
     _set_bump_strengths(material.node_tree,
                         float(scene.mpfb_foot_wrinkles), float(scene.mpfb_foot_pores))
     return True
@@ -261,13 +289,28 @@ def _reset_foot_material(basemesh):
     material = mesh.materials[0]
     if not material.get(_MATERIAL_MARK):
         return False
-    original = bpy.data.materials.get(material.get(_ORIGINAL_MATERIAL, ""))
-    if original:
-        mesh.materials[0] = original
+
+    if material.get("mpfb_foot_created_skin", False):
+        if material.get("mpfb_foot_had_slot", False):
+            mesh.materials[0] = None
+        else:
+            mesh.materials.pop(index=0)
+        if material.users == 0:
+            bpy.data.materials.remove(material)
         return True
+
+    original = bpy.data.materials.get(material.get(_ORIGINAL_MATERIAL, ""))
+    if original is not None:
+        mesh.materials[0] = original
+        original.use_fake_user = bool(material.get("mpfb_foot_original_fake_user", False))
+        if material.users == 0:
+            bpy.data.materials.remove(material)
+        return True
+
+    # Source skin was manually deleted, so mute the bump rather than removing
+    # the last remaining material and leaving the character unshaded.
     _set_bump_strengths(material.node_tree, 0.0, 0.0)
     return False
-
 
 class MPFB_OT_Apply_Foot_Realism(MpfbOperator):
     """Add non-destructive arches, pads and procedural foot skin detail"""
@@ -316,9 +359,14 @@ class MPFB_OT_Apply_Foot_Realism(MpfbOperator):
         if MODEL_PROPERTIES.get_value("refit", entity_reference=scene):
             HumanService.refit(basemesh, operator=self)
         if not shader_ready:
-            self.report({'WARNING'}, "Foot shape applied; skin shader needs a node-based Principled body material")
+            self.report({'WARNING'}, "Foot shape applied; your existing skin shader cannot be modified")
         else:
-            self.report({'INFO'}, "Foot arches, heel/toe volume and local wrinkle/skin shader applied")
+            if scene.mpfb_foot_auto_preview and context.area and context.area.type == 'VIEW_3D':
+                try:
+                    context.space_data.shading.type = 'MATERIAL'
+                except (AttributeError, TypeError):
+                    pass
+            self.report({'INFO'}, "Foot shape and skin detail applied; use Material Preview and zoom in")
         return {'FINISHED'}
 
 
@@ -356,6 +404,35 @@ class MPFB_OT_Reset_Foot_Realism(MpfbOperator):
 
 
 ClassManager.add_class(MPFB_OT_Reset_Foot_Realism)
+
+
+class MPFB_OT_Preview_Foot_Skin(MpfbOperator):
+    """Enable Material Preview so fine wrinkle normals can be seen"""
+
+    bl_idname = "mpfb.preview_foot_skin"
+    bl_label = "Show foot skin details"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.area and context.area.type == 'VIEW_3D')
+
+    def get_logger(self):
+        return _LOG
+
+    def hardened_execute(self, context):
+        context.space_data.shading.type = 'MATERIAL'
+        self.report({'INFO'}, "Material Preview enabled. Zoom into the feet to inspect skin texture")
+        return {'FINISHED'}
+
+
+ClassManager.add_class(MPFB_OT_Preview_Foot_Skin)
+
+
+bpy.types.Scene.mpfb_foot_auto_preview = BoolProperty(
+    name="Auto-show Material Preview",
+    description="Switch the 3D viewport from Solid to Material Preview when applying foot detail",
+    default=True)
 
 
 for _key, _label, _desc, _default in (
@@ -399,6 +476,9 @@ class MPFB_PT_Foot_Realism_Panel(Abstract_Panel):
         op = layout.operator("mpfb.apply_foot_realism", text="Apply custom foot detail")
         op.preset = "CUSTOM"
         layout.operator("mpfb.reset_foot_realism", text="Mute foot details", icon='LOOP_BACK')
+        layout.prop(scene, "mpfb_foot_auto_preview")
+        layout.operator("mpfb.preview_foot_skin", text="Show skin wrinkles in Material Preview")
+        layout.label(text="Zoom to feet: Solid mode hides skin wrinkles")
         layout.label(text="Skin detail is Blender-only until baked")
         layout.label(text="Use Model > Feet for overall foot sizing")
 
