@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "mpfb"
-version = "2.0.19"
+version = "2.0.20"
 name = "MPFB Character Studio"
 tagline = "Human maker with physique, face-photo and realistic foot tools"
 maintainer = "MakeHuman community; Character Studio extensions by Code-Explode-Studios"
