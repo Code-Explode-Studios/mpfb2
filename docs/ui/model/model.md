@@ -1,5 +1,7 @@
 # Model
 
+New: [One-click male and female muscularity presets](muscularitypresets.md) for lean, athletic, bodybuilder and power/mass physiques.
+
 **Source:** `src/mpfb/ui/model/`
 
 ## Overview
