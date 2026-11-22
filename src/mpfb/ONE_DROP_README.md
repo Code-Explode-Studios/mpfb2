@@ -4,7 +4,7 @@ This is the full MakeHuman/MPFB Blender extension with **all three** experimenta
 
 - **Model → Muscularity presets** — eight male/female physique presets.
 - **Model → Face photo fit** — one or two photo/landmark references, including nose/chin depth.
-- **Model → Foot shape & skin realism** — arches, heel/forefoot pads, toe shape and masked pore/wrinkle shader.
+- **Model → Foot shape & skin realism** — arches, heel/forefoot pads, toe shape and masked pore/wrinkle shader. Creates a neutral skin preview automatically for a brand-new untextured human, then switches to Material Preview to display the wrinkles.
 
 ## Install: ONE archive, not the GitHub repo ZIP
 
@@ -22,6 +22,10 @@ Face image detection uses Google's MediaPipe, which is a substantial platform-sp
 For actual JPEG/PNG photo fitting, click **Set up local face detector** in **Model → Face photo fit**. The setup uses Python in a dedicated folder outside your extension and downloads the official Face Landmarker model + MediaPipe from their sources. This **requires internet once**, no manual terminal/pip commands, and **does not upload your photos**. Afterwards, pick your photo(s) and click **Detect & fit photo** or **Detect & fit both photos**.
 
 If auto setup is unsupported by your Blender/Python distribution (or offline), the UI retains its **External Python** and **Landmarks JSON** input paths. The rest of MPFB, muscles, feet and face-shaping sliders need **no additional installation**.
+
+### Default human / realistic foot quick test
+
+Create a default human, open Model → Foot shape & skin realism and click Natural or Athletic. A missing skin pack is **not** an error: the extension generates a temporary neutral node-based skin material. Blender automatically switches to Material Preview (you can disable this with the Auto-show Material Preview checkbox). Zoom into the feet to see the shader wrinkles; they do **not** appear in Solid View. Use Mute foot details to restore the original no-material state or your authored skin.
 
 ### Unity/export
 
