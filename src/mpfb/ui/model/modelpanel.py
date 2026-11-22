@@ -94,3 +94,4 @@ from ._macrosubpanel import MPFB_PT_Macro_Sub_Panel
 from ._modelsubpanels import *
 from .muscularitypresets import MPFB_PT_Muscularity_Presets_Panel
 from .facephotofit import MPFB_PT_Face_Photo_Fit_Panel
+from .footrealism import MPFB_PT_Foot_Realism_Panel
