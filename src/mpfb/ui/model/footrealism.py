@@ -308,7 +308,11 @@ class MPFB_OT_Apply_Foot_Realism(MpfbOperator):
         _set_shape_keys(basemesh, basis, fields, scene)
         _write_float_attribute(basemesh.data, CREASE_ATTRIBUTE, fields["crease"])
         _write_float_attribute(basemesh.data, PORE_ATTRIBUTE, fields["pores"])
-        shader_ready = _ensure_skin_material(basemesh, scene)
+        try:
+            shader_ready = _ensure_skin_material(basemesh, scene)
+        except (RuntimeError, ValueError, TypeError, KeyError, AttributeError) as err:
+            shader_ready = False
+            self.report({'WARNING'}, "Foot shader unchanged: " + str(err)[:180])
         if MODEL_PROPERTIES.get_value("refit", entity_reference=scene):
             HumanService.refit(basemesh, operator=self)
         if not shader_ready:
@@ -343,10 +347,11 @@ class MPFB_OT_Reset_Foot_Realism(MpfbOperator):
             key = keys.get(name)
             if key:
                 key.value = 0.0
-        _reset_foot_material(basemesh)
+        material_restored = _reset_foot_material(basemesh)
         if MODEL_PROPERTIES.get_value("refit", entity_reference=context.scene):
             HumanService.refit(basemesh, operator=self)
-        self.report({'INFO'}, "Foot detail muted; original body skin material restored")
+        note = " and original skin restored" if material_restored else ""
+        self.report({'INFO'}, "Foot shape details muted" + note)
         return {'FINISHED'}
 
 
