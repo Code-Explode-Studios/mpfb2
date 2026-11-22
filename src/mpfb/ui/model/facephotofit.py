@@ -346,6 +346,16 @@ class MPFB_PT_Face_Photo_Fit_Panel(Abstract_Panel):
         box = layout.box()
         box.label(text="Local photo fitting / frontal neutral face")
         box.prop(scene, "mpfb_facefit_photo")
+        # Thumbnail is best-effort: Blender builds Image previews asynchronously
+        # and some image formats/version combinations cannot supply an icon.
+        photo_path = bpy.path.abspath(scene.mpfb_facefit_photo) if scene.mpfb_facefit_photo else ""
+        if photo_path and os.path.isfile(photo_path):
+            try:
+                image = bpy.data.images.load(photo_path, check_existing=True)
+                if image.preview and image.preview.icon_id:
+                    box.template_icon(icon_value=image.preview.icon_id, scale=8.0)
+            except (OSError, RuntimeError, AttributeError):
+                pass
         box.prop(scene, "mpfb_facefit_model")
         box.prop(scene, "mpfb_facefit_python")
         box.prop(scene, "mpfb_facefit_influence")
