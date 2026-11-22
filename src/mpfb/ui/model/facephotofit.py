@@ -260,12 +260,17 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
             self.report({'ERROR'}, "Select an unbaked MPFB human")
             return {'CANCELLED'}
         scene = context.scene
-        detected = _image_landmarks(scene, self.use_saved_landmarks)
-        mapping_path = os.path.join(LocationService.get_mpfb_data("face_fit"), "mp_to_mpfb.json")
-        with open(mapping_path, encoding="utf-8") as handle:
-            mapping = json.load(handle)["pairs"]
-        observed, indices, weights = _observed_landmarks(detected, mapping)
-        specs = _category_specs()
+        try:
+            detected = _image_landmarks(scene, self.use_saved_landmarks)
+            mapping_path = os.path.join(LocationService.get_mpfb_data("face_fit"), "mp_to_mpfb.json")
+            with open(mapping_path, encoding="utf-8") as handle:
+                mapping = json.load(handle)["pairs"]
+            observed, indices, weights = _observed_landmarks(detected, mapping)
+            specs = _category_specs()
+        except (ValueError, FileNotFoundError, OSError, RuntimeError,
+                ImportError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+            self.report({'ERROR'}, "Face photo fit: " + str(exc)[:220])
+            return {'CANCELLED'}
         if any(i >= len(basemesh.data.vertices) or i < 0 for i in indices):
             self.report({'ERROR'}, "MPFB face vertex correspondence is incompatible with this mesh")
             return {'CANCELLED'}
@@ -301,7 +306,7 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
             HumanService.refit(basemesh, operator=self)
         basemesh["mpfb_facefit_last_rms_before"] = metrics["before"]
         basemesh["mpfb_facefit_last_rms_after"] = metrics["after"]
-        self.report({'INFO'}, "Face fit applied: aligned RMS %.4f -> %.4f (model units)" %
+        self.report({'INFO'}, "Face fit applied: aligned RMS %.4f -> %.4f (normalised face units)" %
                     (metrics["before"], metrics["after"]))
         return {'FINISHED'}
 
