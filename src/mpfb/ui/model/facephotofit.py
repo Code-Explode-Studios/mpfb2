@@ -13,13 +13,14 @@ import subprocess
 
 import bpy
 import numpy as np
-from bpy.props import BoolProperty, FloatProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
 from ... import ClassManager
 from ...services import HumanService, LocationService, LogService, ObjectService, TargetService, UiService
 from ..abstractpanel import Abstract_Panel
 from ..mpfboperator import MpfbOperator
 from .facephotofit_core import fit_landmarks
+from .facephotofit_multiview_core import fit_multiview_landmarks
 from .modelpanel import MODEL_PROPERTIES
 
 _LOG = LogService.get_logger("model.facephotofit")
@@ -44,6 +45,26 @@ FIT_CATEGORIES = (
     "cheek-bones-decr-incr", "forehead-scale-vert-decr-incr",
 )
 
+# These projection/depth targets are only added to the fitting set when the
+# user supplies a separate side reference. The frontal solver is unchanged.
+PROFILE_CATEGORIES = (
+    "nose-trans-backward-forward", "nose-scale-depth-decr-incr",
+    "nose-hump-decr-incr", "nose-greek-decr-incr", "nose-curve-concave-convex",
+    "chin-prominent-decr-incr", "chin-prognathism-decr-incr",
+    "mouth-trans-backward-forward", "mouth-scale-depth-decr-incr",
+    "eyebrows-trans-backward-forward", "forehead-trans-backward-forward",
+    "eye-push1-in-out", "head-scale-depth-decr-incr",
+)
+
+# Only a near-side subset of 57 calibrated MPFB vertices is used for profile
+# matching. Contour landmarks are view-dependent, so downweight side jaw
+# locations and skip the hidden/far eye and brow entirely.
+_PROFILE_COMMON = (168, 6, 4, 1, 2, 0, 13, 14, 17, 152)
+_PROFILE_VISIBLE = {
+    "LEFT": (33, 133, 70, 63, 105, 98, 64, 61, 132, 172),
+    "RIGHT": (263, 362, 300, 293, 334, 327, 294, 291, 361, 397),
+}
+
 # Landmark confidence varies by feature. Frontal eye corners typically produce
 # stable correspondences; the jaw silhouette varies with camera viewpoint.
 _LANDMARK_WEIGHTS = {
@@ -53,12 +74,13 @@ _LANDMARK_WEIGHTS = {
 }
 
 
-def _category_specs():
+def _category_specs(include_profile=False):
     """Construct side-aware fitting morphs from authoritative target metadata."""
     path = os.path.join(LocationService.get_mpfb_data("targets"), "target.json")
     with open(path, encoding="utf-8") as handle:
         sections = json.load(handle)
-    wanted = set(FIT_CATEGORIES)
+    names = FIT_CATEGORIES + (PROFILE_CATEGORIES if include_profile else ())
+    wanted = set(names)
     found = {}
     for section, data in sections.items():
         for category in data.get("categories", []):
@@ -81,21 +103,23 @@ def _category_specs():
     missing = wanted - set(found)
     if missing:
         raise ValueError("Missing built-in facial morph categories: " + ", ".join(sorted(missing)))
-    return [(name, *found[name]) for name in FIT_CATEGORIES]
+    return [(name, *found[name]) for name in names]
 
 
-def _image_landmarks(scene, use_saved_landmarks):
+def _image_landmarks(scene, use_saved_landmarks, profile=False):
     if use_saved_landmarks:
-        path = bpy.path.abspath(scene.mpfb_facefit_landmarks_json)
+        value = scene.mpfb_facefit_profile_landmarks_json if profile else scene.mpfb_facefit_landmarks_json
+        path = bpy.path.abspath(value) if value else ""
         if not path or not os.path.isfile(path):
             raise ValueError("Choose a valid MediaPipe landmarks JSON file")
         with open(path, encoding="utf-8") as handle:
             return json.load(handle)
 
-    photo = bpy.path.abspath(scene.mpfb_facefit_photo)
-    model = bpy.path.abspath(scene.mpfb_facefit_model)
+    photo_value = scene.mpfb_facefit_profile_photo if profile else scene.mpfb_facefit_photo
+    photo = bpy.path.abspath(photo_value) if photo_value else ""
+    model = bpy.path.abspath(scene.mpfb_facefit_model) if scene.mpfb_facefit_model else ""
     if not os.path.isfile(photo):
-        raise ValueError("Choose an existing frontal face photo")
+        raise ValueError("Choose an existing " + ("profile" if profile else "front") + " face photo")
     if not os.path.isfile(model):
         raise ValueError("Choose the Face Landmarker .task model (see setup documentation)")
     configured_python = scene.mpfb_facefit_python.strip()
@@ -113,14 +137,14 @@ def _image_landmarks(scene, use_saved_landmarks):
     return detect(photo, model)
 
 
-def _observed_landmarks(result, mapping):
+def _observed_landmarks(result, mapping, minimum=20):
     points = result.get("landmarks_px", [])
     if not isinstance(points, list) or len(points) < 468:
         raise ValueError("Expected MediaPipe Face Landmarker JSON with at least 468 landmark points")
     width, height = float(result.get("width", 0)), float(result.get("height", 0))
     if width <= 0 or height <= 0:
         raise ValueError("Image width/height missing from landmark data")
-    if len(mapping) < 20:
+    if len(mapping) < minimum:
         raise ValueError("Insufficient face vertex correspondences")
     observed = []
     indices = []
@@ -219,6 +243,63 @@ def _face_model(basemesh, indices, specs):
     return current, np.asarray(positive_deltas), np.asarray(negative_deltas), np.asarray(originals)
 
 
+
+def _profile_mapping(mapping, direction):
+    """Select approximately visible profile features from the calibrated map.
+
+    On steep/near-90-degree images MediaPipe may hallucinate the hidden side.
+    Restrict the fit to nose, chin, lips, one eye/brow and near-side jaw.
+    """
+    if direction not in _PROFILE_VISIBLE:
+        raise ValueError("Unknown profile orientation")
+    selected = set(_PROFILE_COMMON + _PROFILE_VISIBLE[direction])
+    result = [pair for pair in mapping if int(pair["mp"]) in selected]
+    if len(result) < 12 or len({int(p["mp"]) for p in result}) != len(result):
+        raise ValueError("Insufficient unique calibrated profile landmarks")
+    return result
+
+
+def _face_model_3d(basemesh, indices, specs):
+    """Extract the current 3D head and signed shape-key deltas.
+
+    Non-fitted keys and all phenotype macro keys remain included in the rest
+    mesh, so fitting does not overwrite the body or unrelated facial controls.
+    """
+    mesh = basemesh.data
+    keys = mesh.shape_keys
+    if not keys or not keys.use_relative or not keys.reference_key:
+        raise ValueError("Requires an editable MPFB relative-shape-key basemesh")
+    if any(i < 0 or i >= len(mesh.vertices) for i in indices):
+        raise ValueError("Profile landmark mapping is incompatible with this MPFB mesh")
+
+    def coords(items):
+        return np.asarray([(float(v.x), float(v.y), float(v.z)) for v in items], dtype=np.float64)
+
+    basis = keys.reference_key
+    current = coords([basis.data[i].co for i in indices])
+    deltas = {}
+    for key in keys.key_blocks:
+        if key is basis:
+            continue
+        relative = key.relative_key or basis
+        delta = coords([key.data[i].co - relative.data[i].co for i in indices])
+        deltas[key.name] = delta
+        if key.value:
+            current += delta * float(key.value)
+    pos, neg, initial = [], [], []
+    for _, _, positive, negative in specs:
+        p = np.sum([deltas[n] for n in positive], axis=0)
+        n = np.sum([deltas[n] for n in negative], axis=0) if negative else np.zeros_like(p)
+        plus = float(np.mean([keys.key_blocks[n].value for n in positive]))
+        minus = float(np.mean([keys.key_blocks[n].value for n in negative])) if negative else 0.0
+        initial.append(float(np.clip(plus - minus, -1.0, 1.0)))
+        for name in positive + negative:
+            current -= deltas[name] * float(keys.key_blocks[name].value)
+        pos.append(p)
+        neg.append(n)
+    return current, np.asarray(pos), np.asarray(neg), np.asarray(initial)
+
+
 def _apply_face_values(basemesh, specs, fitted, loaded, prune):
     keys = basemesh.data.shape_keys.key_blocks
     for value, (_, _, positive, negative) in zip(fitted, specs):
@@ -243,6 +324,7 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
     bl_options = {'REGISTER', 'UNDO'}
 
     use_saved_landmarks: BoolProperty(name="Use landmark JSON", default=False)
+    use_profile: BoolProperty(name="Also fit side reference", default=False)
 
     @classmethod
     def poll(cls, context):
@@ -262,11 +344,23 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
         scene = context.scene
         try:
             detected = _image_landmarks(scene, self.use_saved_landmarks)
+            profile_data = (_image_landmarks(scene, self.use_saved_landmarks, profile=True)
+                            if self.use_profile else None)
             mapping_path = os.path.join(LocationService.get_mpfb_data("face_fit"), "mp_to_mpfb.json")
             with open(mapping_path, encoding="utf-8") as handle:
                 mapping = json.load(handle)["pairs"]
             observed, indices, weights = _observed_landmarks(detected, mapping)
-            specs = _category_specs()
+            specs = _category_specs(include_profile=self.use_profile)
+            if self.use_profile:
+                profile_map = _profile_mapping(mapping, scene.mpfb_facefit_profile_direction)
+                side_observed, _, side_weights = _observed_landmarks(
+                    profile_data, profile_map, minimum=12)
+                front_positions = {int(pair["mp"]): j for j, pair in enumerate(mapping)}
+                side_positions = [front_positions[int(pair["mp"])] for pair in profile_map]
+                # The side view is less reliable near the cheek/jaw contour.
+                for j, pair in enumerate(profile_map):
+                    if int(pair["mp"]) in (132, 172, 361, 397):
+                        side_weights[j] *= 0.5
         except (ValueError, FileNotFoundError, OSError, RuntimeError,
                 ImportError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
             self.report({'ERROR'}, "Face photo fit: " + str(exc)[:220])
@@ -279,12 +373,23 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
         loaded = []
         try:
             loaded = _prepare_face_targets(basemesh, specs)
-            rest, pos, neg, initial = _face_model(basemesh, indices, specs)
-            result, metrics = fit_landmarks(
-                rest, pos, neg, observed, weights, initial=initial,
-                influence=float(scene.mpfb_facefit_influence),
-                regularization=float(scene.mpfb_facefit_regularization),
-            )
+            if self.use_profile:
+                rest, pos, neg, initial = _face_model_3d(basemesh, indices, specs)
+                result, metrics = fit_multiview_landmarks(
+                    rest, pos, neg, observed, weights,
+                    side_observed, side_positions, side_weights,
+                    profile_direction=scene.mpfb_facefit_profile_direction,
+                    profile_strength=float(scene.mpfb_facefit_profile_strength),
+                    initial=initial, influence=float(scene.mpfb_facefit_influence),
+                    regularization=float(scene.mpfb_facefit_regularization),
+                )
+            else:
+                rest, pos, neg, initial = _face_model(basemesh, indices, specs)
+                result, metrics = fit_landmarks(
+                    rest, pos, neg, observed, weights, initial=initial,
+                    influence=float(scene.mpfb_facefit_influence),
+                    regularization=float(scene.mpfb_facefit_regularization),
+                )
             # An aligned residual should not worsen significantly: the user's
             # model may differ from the face in angle or expression.
             if not np.all(np.isfinite(result)):
@@ -304,10 +409,19 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
 
         if MODEL_PROPERTIES.get_value("refit", entity_reference=scene):
             HumanService.refit(basemesh, operator=self)
-        basemesh["mpfb_facefit_last_rms_before"] = metrics["before"]
-        basemesh["mpfb_facefit_last_rms_after"] = metrics["after"]
-        self.report({'INFO'}, "Face fit applied: aligned RMS %.4f -> %.4f (normalised face units)" %
-                    (metrics["before"], metrics["after"]))
+        if self.use_profile:
+            basemesh["mpfb_facefit_last_rms_before"] = metrics["front_before"]
+            basemesh["mpfb_facefit_last_rms_after"] = metrics["front_after"]
+            basemesh["mpfb_facefit_profile_rms_before"] = metrics["profile_before"]
+            basemesh["mpfb_facefit_profile_rms_after"] = metrics["profile_after"]
+            self.report({'INFO'}, "Front %.4f -> %.4f / profile %.4f -> %.4f (normalised)" %
+                        (metrics["front_before"], metrics["front_after"],
+                         metrics["profile_before"], metrics["profile_after"]))
+        else:
+            basemesh["mpfb_facefit_last_rms_before"] = metrics["before"]
+            basemesh["mpfb_facefit_last_rms_after"] = metrics["after"]
+            self.report({'INFO'}, "Face fit applied: aligned RMS %.4f -> %.4f (normalised face units)" %
+                        (metrics["before"], metrics["after"]))
         return {'FINISHED'}
 
 
@@ -329,6 +443,18 @@ bpy.types.Scene.mpfb_facefit_influence = FloatProperty(
 bpy.types.Scene.mpfb_facefit_regularization = FloatProperty(
     name="Shape preservation", description="Penalty on large slider changes (higher means subtler)",
     min=0.0, max=0.1, default=0.002, precision=4)
+bpy.types.Scene.mpfb_facefit_profile_photo = StringProperty(
+    name="Side photo", description="Near-profile side photo (kept local)", subtype='FILE_PATH')
+bpy.types.Scene.mpfb_facefit_profile_landmarks_json = StringProperty(
+    name="Side landmarks JSON", description="Pre-extracted profile landmarks", subtype='FILE_PATH')
+bpy.types.Scene.mpfb_facefit_profile_direction = EnumProperty(
+    name="Nose points", description="Direction the photographed face is pointing in the image",
+    items=(("LEFT", "Left", "The nose points toward image left"),
+           ("RIGHT", "Right", "The nose points toward image right")),
+    default="LEFT")
+bpy.types.Scene.mpfb_facefit_profile_strength = FloatProperty(
+    name="Side influence", description="How strongly the side-photo profile constrains depth",
+    min=0.1, max=3.0, default=1.0, precision=2)
 
 
 class MPFB_PT_Face_Photo_Fit_Panel(Abstract_Panel):
@@ -367,11 +493,27 @@ class MPFB_PT_Face_Photo_Fit_Panel(Abstract_Panel):
         box.prop(scene, "mpfb_facefit_regularization")
         button = box.operator("mpfb.fit_face_photo", text="Detect & fit photo", icon='FACESEL')
         button.use_saved_landmarks = False
+        button.use_profile = False
         extra = layout.box()
         extra.label(text="Alternative: pre-extracted landmarks")
         extra.prop(scene, "mpfb_facefit_landmarks_json")
         button = extra.operator("mpfb.fit_face_photo", text="Fit from landmarks JSON")
         button.use_saved_landmarks = True
+        button.use_profile = False
+
+        side = layout.box()
+        side.label(text="Upgrade: front + near-profile")
+        side.prop(scene, "mpfb_facefit_profile_photo")
+        side.prop(scene, "mpfb_facefit_profile_direction")
+        side.prop(scene, "mpfb_facefit_profile_strength")
+        b = side.operator("mpfb.fit_face_photo", text="Detect & fit both photos", icon='FACESEL')
+        b.use_saved_landmarks = False
+        b.use_profile = True
+        side.prop(scene, "mpfb_facefit_profile_landmarks_json")
+        b = side.operator("mpfb.fit_face_photo", text="Fit both landmark JSON files")
+        b.use_saved_landmarks = True
+        b.use_profile = True
+        side.label(text="Near-profile (about 60-85 degrees) works best")
         layout.label(text="Adjust facial sliders after fitting")
         layout.label(text="Refit assets/rig if auto-refit is off")
 
