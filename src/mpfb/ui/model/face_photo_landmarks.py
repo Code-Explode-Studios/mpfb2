@@ -38,7 +38,7 @@ def detect(image_path, model_path):
         img = mp.Image.create_from_file(image_path)
         result = detector.detect(img)
     if not result.face_landmarks:
-        raise ValueError("No face detected. Use a well-lit frontal portrait with a neutral expression.")
+        raise ValueError("No face detected. Use a well-lit, unobstructed front or near-profile portrait; very steep side views may fail.")
     landmarks = result.face_landmarks[0]
     return {
         "format": "mpfb-mediapipe-landmarks-v1",
