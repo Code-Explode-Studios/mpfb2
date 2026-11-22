@@ -165,8 +165,8 @@ class MPFB_PT_Muscularity_Presets_Panel(Abstract_Panel):
     bl_label = "Muscularity presets"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "MPFB_PT_Model_Panel"
-    bl_category = UiService.get_value("MODELCATEGORY")
+    bl_parent_id = "MPFB_PT_Experimental_Features_Panel"
+    bl_category = "Experimental Features"
     bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
