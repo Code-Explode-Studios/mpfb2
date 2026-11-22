@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 id = "mpfb"
-version = "2.0.18"
-name = "MPFB"
-tagline = "Human character generator and editor"
-maintainer = "Joel Palmius"
+version = "2.0.21"
+name = "MPFB Character Studio"
+tagline = "Human maker with experimental HD mesh, physique and face tools"
+maintainer = "MakeHuman community; Character Studio extensions by Code-Explode-Studios"
 type = "add-on"
 website = "http://static.makehumancommunity.org/mpfb.html"
 tags = ["Add Mesh", "Rigging"]
@@ -14,5 +14,5 @@ license = [
 
 [permissions]
 files = "Load and save data"
-network = "(optional) Interact with local instance of MakeHuman"
+network = "(optional) Interact with local MakeHuman and download face detector when user clicks one-time setup"
 

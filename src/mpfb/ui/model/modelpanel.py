@@ -4,6 +4,7 @@ import bpy, os
 from ... import ClassManager
 from ...services import LogService
 from ...services import TargetService
+from ...services import ObjectService
 from ...services import UiService
 from ...services import SceneConfigSet
 
@@ -91,3 +92,9 @@ ClassManager.add_class(MPFB_PT_Model_Panel)
 
 from ._macrosubpanel import MPFB_PT_Macro_Sub_Panel
 from ._modelsubpanels import *
+from .experimentalpanel import MPFB_PT_Experimental_Features_Panel
+from .muscularitypresets import MPFB_PT_Muscularity_Presets_Panel
+from .facephotofit import MPFB_PT_Face_Photo_Fit_Panel
+from .footrealism import MPFB_PT_Foot_Realism_Panel
+
+from .hdgeometry import MPFB_PT_HD_Geometry_Panel

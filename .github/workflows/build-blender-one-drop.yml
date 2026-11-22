@@ -1,0 +1,71 @@
+name: Build MPFB Character Studio one-drop ZIP
+
+on:
+  push:
+    branches:
+      - feature/male-female-muscularity-presets
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/mpfb/**'
+      - 'tools/build_onedrop.py'
+      - '.github/workflows/build-blender-one-drop.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  zip-extension:
+    name: Validate and package one Blender ZIP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check full MPFB source and feature integration
+        run: python tools/build_onedrop.py --check
+      - name: Build flat-root Blender extension archive
+        run: python tools/build_onedrop.py --output dist/MPFB-Character-Studio.zip
+      - name: Validate ZIP root, data files and CRC
+        run: |
+          python - <<'PY'
+          import zipfile
+          p = 'dist/MPFB-Character-Studio.zip'
+          with zipfile.ZipFile(p) as archive:
+              assert archive.testzip() is None
+              names = set(archive.namelist())
+              assert 'blender_manifest.toml' in names
+              assert '__init__.py' in names
+              assert 'ui/model/muscularitypresets.py' in names
+              assert 'ui/model/facephotofit.py' in names
+              assert 'ui/model/facephotofit_multiview_core.py' in names
+              assert 'ui/model/face_detector_setup.py' in names
+              assert 'ui/model/footrealism.py' in names
+              assert 'data/3dobjs/base.obj' in names
+              assert len(names) > 100
+              print('Validated', len(names), 'files in a single Blender extension ZIP')
+          PY
+      - name: Upload one-drop Blender ZIP as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MPFB-Character-Studio
+          path: dist/MPFB-Character-Studio.zip
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish experimental preview ZIP as direct release download
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/male-female-muscularity-presets'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=mpfb-character-studio-preview
+          asset=dist/MPFB-Character-Studio.zip
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --target "$GITHUB_SHA" \
+              --title "MPFB Character Studio — experimental one-drop ZIP" \
+              --notes "Development preview: all original MPFB tools + muscularity presets + one/two photo face fitting + realistic feet. Tested package integrity, but NOT verified Blender runtime. Download the ZIP and drag it directly into Blender 4.2+. Face photo detection requires clicking the in-panel one-time local detector setup (network required once)." \
+              --prerelease
+          fi
