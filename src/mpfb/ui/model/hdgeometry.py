@@ -101,6 +101,7 @@ def _image_texture(path, modifier):
 
 def _audit_lines(obj):
     rigs = [mod for mod in obj.modifiers if mod.type == 'ARMATURE']
+    base_rigs = [mod for mod in rigs if not mod.vertex_group and not mod.use_multi_modifier]
     details = [(i, mod) for i, mod in enumerate(obj.modifiers)
                if mod.get(_OWNER) and mod.name in
                (_HD_SUBSURF, _HD_MULTIRES, _HD_DISPLACE)]
@@ -111,8 +112,11 @@ def _audit_lines(obj):
         lines.append("No Armature modifier: pose test unavailable")
     else:
         lines.append("Armature(s): %s" % len(rigs))
-        lines.append("Preserve Volume: %s" %
-                     ("on" if all(m.use_deform_preserve_volume for m in rigs) else "off/mixed"))
+        lines.append("Global Preserve Volume: %s" %
+                     ("on" if base_rigs and all(m.use_deform_preserve_volume for m in base_rigs)
+                      else "off / selective only"))
+        if len(rigs) != len(base_rigs):
+            lines.append("Selective armature groups are protected")
         first_rig = next(i for i, mod in enumerate(obj.modifiers) if mod.type == 'ARMATURE')
         if any(i > first_rig for i, _ in details):
             lines.append("WARNING: HD modifier follows armature; reapply HD setup")
@@ -183,7 +187,7 @@ class MPFB_OT_Apply_HD_Geometry(MpfbOperator):
                 mod = _ensure_modifier(obj, _HD_MULTIRES, 'MULTIRES')
                 desired = scene.mpfb_hd_sculpt_levels
                 while mod.total_levels < desired:
-                    bpy.ops.object.multires_subdivide(modifier=mod.name, mode='CATMULL_CLARK')
+                    bpy.ops.object.multires_subdivide(modifier=mod.name)
                 mod.levels = desired
                 mod.sculpt_levels = desired
                 mod.render_levels = desired
@@ -292,9 +296,10 @@ class MPFB_OT_HD_Rig_Preview(MpfbOperator):
 
     def hardened_execute(self, context):
         obj = _human(context)
-        rigs = [mod for mod in obj.modifiers if mod.type == 'ARMATURE']
+        rigs = [mod for mod in obj.modifiers
+                if mod.type == 'ARMATURE' and not mod.vertex_group and not mod.use_multi_modifier]
         if not rigs:
-            self.report({'WARNING'}, "No Armature modifier found on this body")
+            self.report({'WARNING'}, "No global Armature modifier; selective rig settings untouched")
             return {'CANCELLED'}
         for rig in rigs:
             rig.use_deform_preserve_volume = context.scene.mpfb_hd_preserve_volume
