@@ -112,31 +112,32 @@ def compute_foot_fields(vertices, body_count):
         ball = _gaussian(t, 0.75, 0.12)
         knuckles = _gaussian(t, 0.84, 0.075)
 
-        # Inner plantar arch lifts the sole without compressing the ankle.
-        arch_dz = 0.045 * length * arch * sole * foot_mask
+        # Inner plantar arch lifts the sole, up to around 15-20mm for a
+        # full-strength shape, without compressing the ankle.
+        arch_dz = 0.093 * length * arch * sole * foot_mask
         delta["arch"][i] = (0.0, 0.0, arch_dz)
 
-        # Heel fat pad: outward, round heel silhouette with very shallow
-        # contact padding, no sharp offset at the midline.
+        # Heel fat pad: rounded rearward and lateral silhouette with shallow
+        # plantar cushioning and no hard offset at the midline.
         heel_amount = heel * foot_mask * _clamp(1.0 - rel_height / (0.32 * length))
         sideways = _clamp((abs(x) - 0.5 * (xmin + xmax)) / max(width, 1e-6), -0.5, 0.5)
         delta["heel"][i] = (
-            sign * 0.023 * length * heel_amount * sideways,
-            0.014 * length * heel_amount,
-            -0.003 * length * heel_amount * sole,
+            sign * 0.046 * length * heel_amount * sideways,
+            0.034 * length * heel_amount,
+            -0.008 * length * heel_amount * sole,
         )
 
-        # Forefoot cushion, keeping the change comfortably under ~3mm
-        # on a typical human foot; sole/ball silhouette only.
+        # More visible forefoot cushion (up to roughly 5mm on a 25cm foot);
+        # concentrated under the metatarsals rather than all across the toes.
         ball_amount = ball * foot_mask * sole
         delta["ball"][i] = (
-            sign * 0.008 * length * ball_amount * (u - 0.5),
+            sign * 0.020 * length * ball_amount * (u - 0.5),
             0.0,
-            -0.010 * length * ball_amount,
+            -0.020 * length * ball_amount,
         )
         # Subtle dorsal soft tissue over toe bases, not across the sole.
         knuckle_amount = knuckles * dorsal * foot_mask
-        delta["toes"][i] = (0.0, 0.0, 0.017 * length * knuckle_amount)
+        delta["toes"][i] = (0.0, 0.0, 0.034 * length * knuckle_amount)
 
         # Creases favour metatarsal / toe flexion folds and heel skin;
         # fine pores are weaker on the dorsal (thin-skin) surface.
