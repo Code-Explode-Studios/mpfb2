@@ -10,6 +10,7 @@ Copyright (C) 2026 MPFB contributors. GPL-3.0-or-later.
 import json
 import os
 import subprocess
+import sys
 
 import bpy
 import numpy as np
@@ -428,6 +429,117 @@ class MPFB_OT_Fit_Face_Photo(MpfbOperator):
 ClassManager.add_class(MPFB_OT_Fit_Face_Photo)
 
 
+_SETUP_PROCESS = None
+_SETUP_LOG = None
+_SETUP_DIR = None
+
+
+def _face_detector_install_dir():
+    # Never write inside the installed extension: Blender extensions may be
+    # read-only. The isolated dependency environment lives in user config.
+    path = bpy.utils.user_resource("CONFIG", path="mpfb_character_studio/face_detector",
+                                   create=True)
+    if not path:
+        raise ValueError("Could not find Blender user config directory")
+    return path
+
+
+def _detector_paths():
+    folder = _face_detector_install_dir()
+    py = os.path.join(folder, "venv", "Scripts" if os.name == "nt" else "bin",
+                      "python.exe" if os.name == "nt" else "python")
+    model = os.path.join(folder, "face_landmarker.task")
+    return py, model
+
+
+def _detector_setup_poll():
+    """Non-blocking Blender timer: process is external, no bpy use on workers."""
+    global _SETUP_PROCESS, _SETUP_LOG, _SETUP_DIR
+    if _SETUP_PROCESS is None:
+        return None
+    if _SETUP_PROCESS.poll() is None:
+        return 1.0
+    code = _SETUP_PROCESS.returncode
+    if _SETUP_LOG is not None:
+        _SETUP_LOG.close()
+        _SETUP_LOG = None
+    py, model = _detector_paths()
+    if code == 0 and os.path.isfile(py) and os.path.isfile(model):
+        for scene in bpy.data.scenes:
+            scene.mpfb_facefit_python = py
+            scene.mpfb_facefit_model = model
+            scene.mpfb_facefit_setup_status = "Ready: local face detector installed"
+        _LOG.info("Installed isolated local MediaPipe detector", py)
+    else:
+        log_path = os.path.join(_SETUP_DIR, "setup.log") if _SETUP_DIR else "setup.log"
+        for scene in bpy.data.scenes:
+            scene.mpfb_facefit_setup_status = "Setup failed; see " + log_path
+        _LOG.error("Face detector setup failed", (code, log_path))
+    _SETUP_PROCESS = None
+    _SETUP_DIR = None
+    return None
+
+
+class MPFB_OT_Setup_Face_Detector(MpfbOperator):
+    """One-click opt-in install: isolated MediaPipe environment + official task model"""
+
+    bl_idname = "mpfb.setup_face_detector"
+    bl_label = "Set up local face detector"
+    bl_description = ("Downloads official MediaPipe Python package from PyPI and Face Landmarker "
+                      "model to an isolated user directory. Requires internet once.")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.scene is not None and _SETUP_PROCESS is None)
+
+    def get_logger(self):
+        return _LOG
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def hardened_execute(self, context):
+        global _SETUP_PROCESS, _SETUP_LOG, _SETUP_DIR
+        if _SETUP_PROCESS is not None:
+            self.report({'WARNING'}, "Face detector setup is already running")
+            return {'CANCELLED'}
+        if not bpy.app.online_access:
+            self.report({'ERROR'}, "Enable Online Access in Blender preferences to set up MediaPipe")
+            return {'CANCELLED'}
+        try:
+            directory = _face_detector_install_dir()
+            setup_py = os.path.join(os.path.dirname(__file__), "face_detector_setup.py")
+            logpath = os.path.join(directory, "setup.log")
+            _SETUP_LOG = open(logpath, "w", encoding="utf-8")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            # Blender is not a Python executable. The helper finds the bundled
+            # Python or a compatible system Python and creates an isolated venv.
+            _SETUP_PROCESS = subprocess.Popen(
+                [sys.executable, "--background", "--python-expr",
+                 "import runpy, sys; sys.argv = [%r, '--destination', %r]; "
+                 "runpy.run_path(%r, run_name='__main__')" %
+                 (setup_py, directory, setup_py)],
+                stdout=_SETUP_LOG, stderr=subprocess.STDOUT,
+                close_fds=True, creationflags=flags)
+            _SETUP_DIR = directory
+            context.scene.mpfb_facefit_setup_status = "Installing detector in background..."
+            bpy.app.timers.register(_detector_setup_poll, first_interval=1.0)
+        except Exception as exc:
+            if _SETUP_LOG is not None:
+                _SETUP_LOG.close()
+                _SETUP_LOG = None
+            _SETUP_PROCESS = None
+            _SETUP_DIR = None
+            self.report({'ERROR'}, "Could not start face detector setup: " + str(exc)[:180])
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Face detector installing; Blender remains usable. Check panel status.")
+        return {'FINISHED'}
+
+
+ClassManager.add_class(MPFB_OT_Setup_Face_Detector)
+
+
 # Scene settings provide file pickers without requiring any extra add-on.
 bpy.types.Scene.mpfb_facefit_photo = StringProperty(
     name="Face photo", description="Frontal reference portrait (kept local)", subtype='FILE_PATH')
@@ -443,6 +555,9 @@ bpy.types.Scene.mpfb_facefit_influence = FloatProperty(
 bpy.types.Scene.mpfb_facefit_regularization = FloatProperty(
     name="Shape preservation", description="Penalty on large slider changes (higher means subtler)",
     min=0.0, max=0.1, default=0.002, precision=4)
+bpy.types.Scene.mpfb_facefit_setup_status = StringProperty(
+    name="Detector setup", description="Status of optional automatic face detector installation",
+    default="Not installed")
 bpy.types.Scene.mpfb_facefit_profile_photo = StringProperty(
     name="Side photo", description="Near-profile side photo (kept local)", subtype='FILE_PATH')
 bpy.types.Scene.mpfb_facefit_profile_landmarks_json = StringProperty(
@@ -489,6 +604,17 @@ class MPFB_PT_Face_Photo_Fit_Panel(Abstract_Panel):
                 pass
         box.prop(scene, "mpfb_facefit_model")
         box.prop(scene, "mpfb_facefit_python")
+        local_python, local_model = _detector_paths()
+        if os.path.isfile(local_python) and os.path.isfile(local_model):
+            if not scene.mpfb_facefit_python:
+                scene.mpfb_facefit_python = local_python
+            if not scene.mpfb_facefit_model:
+                scene.mpfb_facefit_model = local_model
+        else:
+            box.operator("mpfb.setup_face_detector", text="One-time: set up face detector",
+                         icon='IMPORT')
+            box.label(text="Installs MediaPipe outside Blender / internet once")
+        box.label(text=scene.mpfb_facefit_setup_status)
         box.prop(scene, "mpfb_facefit_influence")
         box.prop(scene, "mpfb_facefit_regularization")
         button = box.operator("mpfb.fit_face_photo", text="Detect & fit photo", icon='FACESEL')
