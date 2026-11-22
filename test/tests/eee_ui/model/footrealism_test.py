@@ -10,7 +10,7 @@ import bpy
 import pytest
 
 from ... import ObjectService, TargetService, dynamic_import
-from .._helpers import HumanFixture, MockOperatorBase
+from .._helpers import HumanFixture, BasemeshWithV2SkinFixture, MockOperatorBase
 
 _CORE = "mpfb.ui.model.footrealism_core"
 _MOD = "mpfb.ui.model.footrealism"
@@ -124,3 +124,33 @@ def test_foot_preset_and_reset_keep_existing_target_values_and_skin():
             assert mesh.data.materials[0] is original
         assert all(mesh.data.shape_keys.key_blocks[n].value == old
                    for n, old in source_keys.items())
+
+
+def _count_foot_bump_nodes(tree, level=0):
+    if tree is None or level > 8:
+        return 0
+    found = 0
+    for node in tree.nodes:
+        if node.type == 'BUMP' and node.name.startswith("MPFB Foot "):
+            found += 1
+        if node.type == 'GROUP' and node.node_tree:
+            found += _count_foot_bump_nodes(node.node_tree, level + 1)
+    return found
+
+
+def test_foot_shader_copies_v2_skin_and_preserves_original_material():
+    # Dedicated skin fixture ensures the actual default nested-group path is
+    # exercised, not only a minimal human with no material slots.
+    with BasemeshWithV2SkinFixture() as fixture:
+        mesh = fixture.basemesh
+        original = mesh.data.materials[0]
+        original_node_count = _count_foot_bump_nodes(original.node_tree)
+        operator = MockOperatorBase(preset="natural")
+        assert Operator.hardened_execute(operator, bpy.context) == {'FINISHED'}
+        modified = mesh.data.materials[0]
+        assert modified is not original
+        assert modified.get("mpfb_foot_procedural_skin")
+        assert _count_foot_bump_nodes(modified.node_tree) >= 2
+        assert _count_foot_bump_nodes(original.node_tree) == original_node_count
+        assert Reset.hardened_execute(MockOperatorBase(), bpy.context) == {'FINISHED'}
+        assert mesh.data.materials[0] is original
