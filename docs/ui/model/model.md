@@ -2,6 +2,8 @@
 
 New: [One-click male and female muscularity presets](muscularitypresets.md) for lean, athletic, bodybuilder and power/mass physiques.
 
+New: [Face photo fitting (experimental)](facephotofit.md) for local MediaPipe landmark-to-MPFB morph fitting.
+
 **Source:** `src/mpfb/ui/model/`
 
 ## Overview
