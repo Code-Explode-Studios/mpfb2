@@ -154,3 +154,57 @@ def test_foot_shader_copies_v2_skin_and_preserves_original_material():
         assert _count_foot_bump_nodes(original.node_tree) == original_node_count
         assert Reset.hardened_execute(MockOperatorBase(), bpy.context) == {'FINISHED'}
         assert mesh.data.materials[0] is original
+
+
+def test_fresh_default_human_gets_generated_skin_preview_and_restores_empty_slots():
+    # Regression: default untextured humans used to warn
+    # "Foot shape applied; skin shader needs a node-based Principled body material".
+    # The extension must work out of the box on the default human, without
+    # requiring the user to first install a system asset/skin pack.
+    with HumanFixture():
+        human = ObjectService.find_object_of_type_amongst_nearest_relatives(
+            bpy.context.active_object, "Basemesh")
+        assert human is not None
+        had_slot = len(human.data.materials) > 0
+        before = human.data.materials[0] if had_slot else None
+        if before is not None:
+            pytest.skip("HumanFixture now ships with a material; no-material path unavailable")
+
+        assert Operator.hardened_execute(MockOperatorBase(preset="natural"), bpy.context) == {'FINISHED'}
+        generated = human.data.materials[0]
+        assert generated is not None
+        assert generated.use_nodes
+        assert generated.get("mpfb_foot_procedural_skin", False)
+        assert generated.get("mpfb_foot_created_skin", False)
+        assert _count_foot_bump_nodes(generated.node_tree) >= 2
+        assert max(v.value for v in human.data.attributes[CreaseName].data) > 0.2
+
+        # Reapplying is idempotent, even for a newly created material.
+        assert Operator.hardened_execute(MockOperatorBase(preset="mature"), bpy.context) == {'FINISHED'}
+        assert human.data.materials[0] is generated
+
+        assert Reset.hardened_execute(MockOperatorBase(), bpy.context) == {'FINISHED'}
+        if had_slot:
+            assert human.data.materials[0] is None
+        else:
+            assert len(human.data.materials) == 0
+
+
+def test_foot_preset_shape_offsets_are_visibly_larger_on_real_hm08():
+    # A previous algorithm displaced arch by only a few millimetres at
+    # maximum, which was barely visible even up close.
+    with HumanFixture():
+        human = ObjectService.find_object_of_type_amongst_nearest_relatives(
+            bpy.context.active_object, "Basemesh")
+        basis = human.data.shape_keys.reference_key
+        coords = [(v.co.x, v.co.y, v.co.z) for v in basis.data]
+        foot = Compute(coords, BodyCount())
+        arch_peak = max(abs(d[2]) for d in foot["deltas"]["arch"])
+        heel_peak = max(max(abs(x) for x in d) for d in foot["deltas"]["heel"])
+        toe_peak = max(abs(d[2]) for d in foot["deltas"]["toes"])
+        # Intended full-strength peaks in metres at default 1.7 m scale.
+        assert arch_peak >= 0.011
+        assert heel_peak >= 0.004
+        assert toe_peak >= 0.006
+        assert all(all(abs(x) < 1e-8 for x in d)
+                   for d in foot["deltas"]["heel"][BodyCount():])
