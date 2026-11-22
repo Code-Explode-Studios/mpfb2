@@ -40,6 +40,7 @@ REQUIRED = (
     "ui/model/facephotofit_core.py",
     "ui/model/facephotofit_multiview_core.py",
     "ui/model/face_photo_landmarks.py",
+    "ui/model/face_detector_setup.py",
     "ui/model/footrealism.py",
     "ui/model/footrealism_core.py",
     "ONE_DROP_README.md",
