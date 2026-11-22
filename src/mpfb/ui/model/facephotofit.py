@@ -1,4 +1,4 @@
-"""Fit an editable MPFB face to a portrait using local MediaPipe landmarks.
+"""Fit an editable MPFB face to front or front+side portraits using local MediaPipe landmarks.
 
 This adapts FaceFit's GPL-3.0 MediaPipe<->MPFB vertex correspondence data
 (https://github.com/VGCLUB/facefit-mpfb) while implementing the fitting UI,
