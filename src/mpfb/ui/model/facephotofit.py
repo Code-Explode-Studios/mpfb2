@@ -98,7 +98,8 @@ def _image_landmarks(scene, use_saved_landmarks):
         raise ValueError("Choose an existing frontal face photo")
     if not os.path.isfile(model):
         raise ValueError("Choose the Face Landmarker .task model (see setup documentation)")
-    interpreter = bpy.path.abspath(scene.mpfb_facefit_python).strip()
+    configured_python = scene.mpfb_facefit_python.strip()
+    interpreter = bpy.path.abspath(configured_python) if configured_python else ""
     if interpreter:
         if not os.path.isfile(interpreter):
             raise ValueError("Configured external Python executable was not found")
