@@ -117,12 +117,21 @@ def _image_landmarks(scene, use_saved_landmarks, profile=False):
 
     photo_value = scene.mpfb_facefit_profile_photo if profile else scene.mpfb_facefit_photo
     photo = bpy.path.abspath(photo_value) if photo_value else ""
-    model = bpy.path.abspath(scene.mpfb_facefit_model) if scene.mpfb_facefit_model else ""
+    model_value = scene.mpfb_facefit_model
+    if not model_value:
+        local_python, local_model = _detector_paths()
+        if os.path.isfile(local_model):
+            model_value = local_model
+    model = bpy.path.abspath(model_value) if model_value else ""
     if not os.path.isfile(photo):
         raise ValueError("Choose an existing " + ("profile" if profile else "front") + " face photo")
     if not os.path.isfile(model):
         raise ValueError("Choose the Face Landmarker .task model (see setup documentation)")
     configured_python = scene.mpfb_facefit_python.strip()
+    if not configured_python:
+        local_python, local_model = _detector_paths()
+        if os.path.isfile(local_python) and os.path.isfile(local_model):
+            configured_python = local_python
     interpreter = bpy.path.abspath(configured_python) if configured_python else ""
     if interpreter:
         if not os.path.isfile(interpreter):
@@ -605,10 +614,7 @@ class MPFB_PT_Face_Photo_Fit_Panel(Abstract_Panel):
         box.prop(scene, "mpfb_facefit_python")
         local_python, local_model = _detector_paths()
         if os.path.isfile(local_python) and os.path.isfile(local_model):
-            if not scene.mpfb_facefit_python:
-                scene.mpfb_facefit_python = local_python
-            if not scene.mpfb_facefit_model:
-                scene.mpfb_facefit_model = local_model
+            box.label(text="Local detector ready (auto-selected)", icon='CHECKMARK')
         else:
             box.operator("mpfb.setup_face_detector", text="One-time: set up face detector",
                          icon='IMPORT')
